@@ -1,5 +1,4 @@
 import warnings
-from datetime import datetime
 from functools import cached_property
 
 import numpy as np
@@ -17,6 +16,11 @@ class SmoothLocalProjection:
     p: int
     n_diff: int
 
+    _Xs: np.ndarray | None
+    _Ys: np.ndarray | None
+    _use: np.ndarray | None
+    _us: np.ndarray | None
+
     def __init__(
         self,
         endog: np.ndarray,
@@ -30,6 +34,7 @@ class SmoothLocalProjection:
         self.endog = endog
         self.shock = shock
         self.exog = exog
+        assert len(self.shock.shape) == 1
         if fe is None:
             self.fe = ()
         else:
@@ -40,6 +45,11 @@ class SmoothLocalProjection:
         self.H = H
         self.p = p
         self.n_diff = 2
+
+        self._Xs = None
+        self._Ys = None
+        self._use = None
+        self._us = None
 
     def fit(
         self,
@@ -57,25 +67,33 @@ class SmoothLocalProjection:
             self.endog, self.shock, self.exog = res
 
         # Build the stacked arrays
-        T = self.endog.shape[0]
-        Ys = []
-        Xs = []
-        fes = []
-        shock_s = []
+        T, k = self.exog.shape
+        use = []
+        Y = []
         for t in range(T):
-            Ys.append(self.endog[t : min(T, t + self.H + 1)])
-            Xs.append(
-                np.repeat(
-                    self.exog[t, :].reshape((1, -1)), min(T - t, self.H + 1), axis=0
-                )
-            )
-            shock_s.append(B[: min(T - t, self.H + 1), :] * self.shock[t])
-            fes.append(list(np.repeat(fe[t], min(T - t, self.H + 1)) for fe in self.fe))
-        Ys = np.concat(Ys)
-        Xs = np.concat(Xs)
-        shock_s = np.concat(shock_s)
-        k_shock = shock_s.shape[1]
-        X = np.concat([shock_s, Xs], axis=1)
+            ty = self.endog[t : min(T, t + self.H + 1)]
+            if t + self.H + 1 >= T:
+                tu = np.arange(t, t + self.H + 1) < T
+                ty = np.concat((ty, np.zeros(self.H + 1 - (T - t))))
+                assert ty.shape[0] == self.H + 1
+            else:
+                tu = np.full_like(ty, True)
+            Y.append(ty)
+            use.append(tu)
+        self._Ys = np.stack(Y, axis=0)
+        exog = self.exog.reshape((T, 1, k))
+        exog = np.repeat(exog, self.H + 1, axis=1)
+        shock = np.einsum("hv,t->thv", B, self.shock)
+        X_s = np.concat((shock, exog), axis=2)
+        # Set the X matrix to zero for all values out of the bound
+        use = np.stack(use, axis=0).reshape((T, self.H + 1, 1)).astype(bool)
+        self._use = use
+        self._Xs = np.where(self._use, X_s, np.zeros_like(X_s))
+
+        Y = self._Ys.flatten()
+        X = self._Xs.reshape(T * (self.H + 1), X_s.shape[2])
+        Y = Y[use.flatten()]
+        X = X[use.flatten(), :]
 
         # Build the penalty matrix
         # For now only identity penalty is implemented
@@ -87,23 +105,25 @@ class SmoothLocalProjection:
 
         if lam is None:
             lam, values = SmoothLocalProjection._tune_lambda(
-                X, Ys, P, k_shock, lam_grid_lower, lam_grid_upper, lam_grid_size
+                X,
+                Y,
+                P,
+                self.H + 1,
+                lam_grid_lower,
+                lam_grid_upper,
+                lam_grid_size,
             )
-
         # Compute the coefficients
-        theta_hat = np.linalg.inv(X.transpose() @ X + lam * P) @ X.transpose() @ Ys
+        theta_hat = np.linalg.inv(X.T @ X + lam * P) @ X.T @ Y
+        self._us = self._Ys - np.einsum("thk,k->th", self._Xs, theta_hat)
 
         return SmoothLocalProjectionResult(
-            self.endog,
-            self.exog,
-            self.shock,
-            self.H,
-            self.p,
+            self,
             knots,
             P,
             lam,
             theta_hat,
-        ), values
+        )
 
     @staticmethod
     def _tune_lambda(
@@ -167,59 +187,29 @@ class SmoothLocalProjection:
 
         return min_gcv, values
 
-    def _D0(self, h):
-        return np.eye(h)
-
-    def _D1(self, h):
-        D = np.zeros((h, h))
-        D[np.arange(1, h), np.arange(h - 1)] = -0.5
-        D[np.arange(h - 1), np.arange(1, h)] = 0.5
-        D[0, 0] = -1
-        D[0, 1] = 1
-        D[h - 1, h - 1] = 1
-        D[h - 1, h - 2] = -1
-        return D
-
-    def _D2(self, h):
-        D = np.diag(np.full((h,), -2))
-        D[np.arange(1, h), np.arange(h - 1)] = 1
-        D[np.arange(h - 1), np.arange(1, h)] = 1
-        D[0, 0] = 1
-        D[0, 1] = -2
-        D[0, 2] = 1
-        D[h - 1, h - 3] = 1
-        D[h - 1, h - 2] = -2
-        D[h - 1, h - 1] = 1
-        return D
-
 
 class SmoothLocalProjectionResult:
-    endog: np.ndarray
-    exog: np.ndarray
-    shock: np.ndarray
-
-    H: int
-    p: int
+    model: SmoothLocalProjection
     knots: np.ndarray
     P: np.ndarray
 
     lam: float
     theta_hat: np.ndarray
 
-    def __init__(self, endog, exog, shock, H, p, knots, P, lam, theta_hat):
-        self.endog = endog
-        self.exog = exog
-        self.shock = shock
-        self.H = H
-        self.p = p
+    def __init__(self, model, knots, P, lam, theta_hat):
+        self.model = model
         self.knots = knots
         self.P = P
         self.lam = lam
         self.theta_hat = theta_hat
 
+    @property
+    def H(self):
+        return self.model.H
+
     @cached_property
     def B(self):
-        b = np.array([bspline(self.p, self.knots, x) for x in range(self.H + 1)])
+        b = np.array([bspline(self.model.p, self.knots, x) for x in range(self.H + 1)])
         return b
 
     @cached_property
@@ -229,44 +219,23 @@ class SmoothLocalProjectionResult:
 
     @cached_property
     def vcov_nw(self):
-        T = self.endog.shape[0]
-        k = self.theta_hat.shape[0]
-        B = np.array([bspline(self.p, self.knots, x) for x in range(self.H + 1)])
-
-        # Build the time matrices
-        s1 = datetime.now()
-        xut = []
-        xpx = np.zeros((k, k))
-        for t in range(T):
-            yt = self.endog[t : min(T, t + self.H + 1)]
-            xt = np.repeat(
-                self.exog[t, :].reshape((1, -1)), min(T - t, self.H + 1), axis=0
-            )
-            st = B[: min(T - t, self.H + 1), :] * self.shock[t]
-            xt = np.concat([st, xt], axis=1)
-
-            xpx += xt.T @ xt
-            ut = (yt - xt @ self.theta_hat).reshape((-1, 1))
-            xut.append(xt.T @ ut)
-
-        s2 = datetime.now()
-        # Build the outer matrices
-        outer = xpx + 0.1 * self.lam * self.P
+        X = self.model._Xs
+        u = self.model._us
+        T, _, k = X.shape
+        lags = self.H + 1
+        xpx1 = np.einsum("thi,thk->ik", X, X)
+        outer = xpx1 + 0.1 * self.lam * self.P
         outer = np.linalg.inv(outer)
-        # LRV
-        deltas = []
-        for l in range(self.H + 1):
-            dl = np.zeros((k, k))
-            for t in range(l, T):
-                dl += xut[t] @ xut[t - l].T
-            deltas.append(1 / T * dl)
-        lrv = deltas[0]
-        for l in range(1, self.H + 1):
-            lrv += (1 - l / (1 + self.H + 1)) * (deltas[l] + deltas[l].T)
-
+        # Compute the Gammas
+        Xpu = np.einsum("thk,th->tk", X, u)
+        lrv = np.zeros((k, k))
+        for j in range(lags + 1):
+            Gamma = 1 / T * np.einsum("tk,ti->ki", Xpu[j:, ...], Xpu[: (T - j), ...])
+            if j == 0:
+                lrv += Gamma
+            else:
+                lrv += (1 - j / (lags + 1)) * (Gamma + Gamma.T)
         vcov_nw = T * outer @ lrv @ outer
-        s3 = datetime.now()
-        print(f"build: {(s2 - s1).total_seconds()}, lrv: {(s3 - s1).total_seconds()}")
         return vcov_nw
 
     @cached_property
