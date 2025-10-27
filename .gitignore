@@ -1,0 +1,7 @@
+**/__pycache__
+playground_*
+external_data
+references
+.venv
+scripts
+

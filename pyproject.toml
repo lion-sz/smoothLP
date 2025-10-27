@@ -1,0 +1,12 @@
+[project]
+name = "smoothlp"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "marimo>=0.17.0",
+    "matplotlib>=3.10.7",
+    "numpy>=2.3.4",
+    "polars>=1.34.0",
+    "statsmodels>=0.14.5",
+]
