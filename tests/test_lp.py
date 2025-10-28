@@ -4,7 +4,7 @@ import polars as pl
 import numpy as np
 from numpy import testing as npt
 
-from src.lp import LocalProjection
+from smoothlp.lp import LocalProjection
 
 
 @pytest.fixture(scope="module")

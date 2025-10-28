@@ -3,7 +3,7 @@ from functools import cached_property
 
 import numpy as np
 
-from src.utils import bspline, demean
+from smoothlp.utils import bspline, demean
 
 
 class SmoothLocalProjection:
