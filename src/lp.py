@@ -64,7 +64,9 @@ class LocalProjection:
 
     def fit(self, vcov="HC3", engine="np"):
         assert engine in ("np", "sm"), f"Engine '{engine}' not recognised."
-        assert vcov in ("HC0", "HC1", "HC3", "HAC"), f"vcov '{vcov}' not recognised."
+        assert vcov in ("non-robust", "HC1", "HC3", "HAC"), (
+            f"vcov '{vcov}' not recognised."
+        )
 
         X = np.concatenate((self.shock.reshape(-1, 1), self.exog), axis=1)
 
@@ -72,11 +74,17 @@ class LocalProjection:
             engine_func = LocalProjection._estimation_np
         else:
             engine_func = LocalProjection._estimation_sm
-        coef, vcov_hc0, vcov_hc1, vcov_hc3, vcov_hac = engine_func(
-            self.endog, X, self.H, vcov, self.mask, self.mask_type
+        coef, vcov_vals = engine_func(
+            self.endog,
+            X,
+            self.H,
+            vcov,
+            self.mask,
+            self.mask_type,
         )
 
         return LocalProjectionResult(
+            self,
             # The data objects
             self.endog,
             self.exog,
@@ -84,10 +92,8 @@ class LocalProjection:
             self.H,
             # Estimated objects
             coef,
-            vcov_hc0,
-            vcov_hc1,
-            vcov_hc3,
-            vcov_hac,
+            vcov_vals,
+            vcov,
         )
 
     @staticmethod
@@ -95,16 +101,13 @@ class LocalProjection:
         Y: np.ndarray,
         X: np.ndarray,
         H: int,
-        vcov: str,
+        vcov_type: str,
         mask: np.ndarray | None,
         mask_type: str = "both",
     ):
         T, k = X.shape
         coef = np.zeros((H + 1, k))
-        vcov_hc0 = np.zeros((H + 1, k, k)) if vcov == "HC0" else None
-        vcov_hc1 = np.zeros((H + 1, k, k)) if vcov == "HC1" else None
-        vcov_hc3 = np.zeros((H + 1, k, k)) if vcov == "HC3" else None
-        vcov_hac = np.zeros((H + 1, k, k)) if vcov == "HAC" else None
+        vcov = np.zeros((H + 1, k, k))
 
         for h in range(H + 1):
             tx = X[: (T - h), :]
@@ -121,37 +124,35 @@ class LocalProjection:
                 tx = tx[~tm, :]
                 ty = ty[~tm]
 
-            xpx_inv = np.linalg.inv(tx.transpose() @ tx)
-            est_mat = xpx_inv @ tx.transpose()
+            xpx_inv = np.linalg.inv(tx.T @ tx)
+            est_mat = xpx_inv @ tx.T
             tc = est_mat @ ty
             coef[h, :] = tc
 
-            if vcov is not None:
+            if vcov_type is not None:
                 t, k = tx.shape
                 resid = ty - tx @ tc
-                if vcov == "HC0":
-                    vcov_hc0[h, :, :] = np.sum(np.square(resid)) / (t - k) * xpx_inv
-                if vcov == "HC1":
-                    vcov_hc1[h, :, :] = (
+                if vcov_type == "non-robust":
+                    vcov[h, :, :] = np.sum(np.square(resid)) / (t - k) * xpx_inv
+                if vcov_type == "HC1":
+                    vcov[h, :, :] = (
                         (t / (t - k))
                         * np.einsum("ij,j->ij", est_mat, np.square(resid))
-                        @ np.transpose(est_mat)
+                        @ est_mat.T
                     )
-                elif vcov == "HC3":
-                    ktt = np.diag(tx @ est_mat)
-                    gamma = est_mat @ resid
+                elif vcov_type == "HC3":
+                    ktt = np.einsum("ij,ji->i", tx, est_mat)
                     u_star = np.square(resid / (1 - ktt))
-                    vcov_hc3[h, :, :] = ((t - 1) / t) * np.einsum(
-                        "jk,k->jk", est_mat, u_star
-                    ) @ np.transpose(est_mat) - ((t - 1) / t**2) * gamma @ np.transpose(
-                        gamma
-                    )
-                elif vcov == "HAC":
-                    vcov_hac[h, :, :] = LocalProjection._vcov_nw(
-                        tx, xpx_inv, resid, h + 1
+                    vcov[h, :, :] = np.einsum("jk,k->jk", est_mat, u_star) @ est_mat.T
+                elif vcov_type == "HAC":
+                    vcov[h, :, :] = LocalProjection._vcov_nw(
+                        tx,
+                        xpx_inv,
+                        resid,
+                        h + 1,
                     )
 
-        return coef, vcov_hc0, vcov_hc1, vcov_hc3, vcov_hac
+        return coef, vcov
 
     @staticmethod
     def _vcov_nw(X: np.ndarray, XpX_inv: np.ndarray, resid: np.ndarray, lags: int):
@@ -168,7 +169,7 @@ class LocalProjection:
             else:
                 lrv += w * (temp + temp.transpose())
         vcov = XpX_inv @ lrv @ XpX_inv
-        vcov = (T / (T - k - 1)) * vcov
+        vcov = (T / (T - k)) * vcov
         return vcov
 
     @staticmethod
@@ -176,16 +177,14 @@ class LocalProjection:
         Y: np.ndarray,
         X: np.ndarray,
         H: int,
-        vcov: str,
+        vcov_type: str,
         mask: np.ndarray | None,
         mask_type: str = "both",
     ):
+        assert vcov_type in ("HC1", "HC3", "HAC")
         T, k = X.shape
         coef = np.zeros((H + 1, k))
-        vcov_hc0 = np.zeros((H + 1, k, k)) if vcov == "HC0" else None
-        vcov_hc1 = np.zeros((H + 1, k, k)) if vcov == "HC1" else None
-        vcov_hc3 = np.zeros((H + 1, k, k)) if vcov == "HC3" else None
-        vcov_hac = np.zeros((H + 1, k, k)) if vcov == "HAC" else None
+        vcov = np.zeros((H + 1, k, k))
 
         for h in range(H + 1):
             tx = X[: (T - h), :]
@@ -203,21 +202,22 @@ class LocalProjection:
                     tx = tx[~mask[: (T - h)]]
                     ty = ty[~mask[: (T - h)]]
 
-            tmod = sm.OLS(ty, tx).fit(cov_type=vcov if vcov != "HAC" else "HC0")
+            tmod = sm.OLS(ty, tx).fit(
+                cov_type=vcov_type if vcov_type != "HAC" else "HC0"
+            )
             coef[h, :] = tmod.params
-            if vcov == "HC0":
-                vcov_hc0[h, :, :] = tmod.cov_HC0
-            elif vcov == "HC1":
-                vcov_hc1[h, :, :] = tmod.cov_HC1
-            elif vcov == "HC3":
-                vcov_hc3[h, :, :] = tmod.cov_HC3
+            if vcov_type == "HC1":
+                vcov[h, :, :] = tmod.cov_HC1
+            elif vcov_type == "HC3":
+                vcov[h, :, :] = tmod.cov_HC3
             else:
-                vcov_hac[h, :, :] = sm.stats.cov_hac(tmod, nlags=h + 1)
+                vcov[h, :, :] = sm.stats.cov_hac(tmod, nlags=h + 1)
 
-        return coef, vcov_hc0, vcov_hc1, vcov_hc3, vcov_hac
+        return coef, vcov
 
 
 class LocalProjectionResult(NamedTuple):
+    model: LocalProjection
     endog: np.ndarray
     exog: np.ndarray
     shock: np.ndarray
@@ -225,10 +225,8 @@ class LocalProjectionResult(NamedTuple):
     H: int
 
     coefs: np.ndarray
-    vcov_HC0: np.ndarray | None
-    vcov_HC1: np.ndarray | None
-    vcov_HC3: np.ndarray | None
-    vcov_HAC: np.ndarray | None
+    vcov: np.ndarray
+    vcov_type: str
 
     @property
     def irf(self):
@@ -236,37 +234,4 @@ class LocalProjectionResult(NamedTuple):
 
     @property
     def se(self):
-        if self.vcov_HC0 is not None:
-            return np.sqrt(self.vcov_HC0[:, 0, 0])
-        elif self.vcov_HC1 is not None:
-            return np.sqrt(self.vcov_HC1[:, 0, 0])
-        elif self.vcov_HC3 is not None:
-            return np.sqrt(self.vcov_HC3[:, 0, 0])
-        elif self.vcov_HAC is not None:
-            return np.sqrt(self.vcov_HAC[:, 0, 0])
-        else:
-            raise ValueError("No variance precomputed.")
-
-    @property
-    def se_hc0(self):
-        if self.vcov_HC0 is not None:
-            return np.sqrt(self.vcov_HC0[:, 0, 0])
-        return None
-
-    @property
-    def se_hc1(self):
-        if self.vcov_HC1 is not None:
-            return np.sqrt(self.vcov_HC1[:, 0, 0])
-        return None
-
-    @property
-    def se_hc3(self):
-        if self.vcov_HC3 is not None:
-            return np.sqrt(self.vcov_HC3[:, 0, 0])
-        return None
-
-    @property
-    def se_hac(self):
-        if self.vcov_HAC is not None:
-            return np.sqrt(self.vcov_HAC[:, 0, 0])
-        return None
+        return np.sqrt(self.vcov[:, 0, 0])

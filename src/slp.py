@@ -16,9 +16,13 @@ class SmoothLocalProjection:
     p: int
     n_diff: int
 
+    mask: np.ndarray | None
+    mask_type: str
+    mask_any_prev_h: bool
+
     _Xs: np.ndarray | None
     _Ys: np.ndarray | None
-    _use: np.ndarray | None
+    _omit: np.ndarray | None
     _us: np.ndarray | None
 
     def __init__(
@@ -30,6 +34,9 @@ class SmoothLocalProjection:
         p: int = 3,
         n_diff: int = 2,
         fe: tuple[np.ndarray] | np.ndarray | None = None,
+        mask: np.ndarray | None = None,
+        mask_type: str = "both",
+        mask_any_prev_h: bool = True,
     ):
         self.endog = endog
         self.shock = shock
@@ -44,11 +51,16 @@ class SmoothLocalProjection:
                 self.fe = fe
         self.H = H
         self.p = p
-        self.n_diff = 2
+        self.n_diff = n_diff
+
+        assert mask_type in ("x", "y", "both")
+        self.mask = mask
+        self.mask_type = mask_type
+        self.mask_any_prev_h = mask_any_prev_h
 
         self._Xs = None
         self._Ys = None
-        self._use = None
+        self._omit = None
         self._us = None
 
     def fit(
@@ -63,37 +75,52 @@ class SmoothLocalProjection:
         B = np.array([bspline(self.p, knots, x) for x in range(self.H + 1)])
 
         if len(self.fe) > 0:
-            res = demean(self.fe, [self.endog, self.shock, self.exog])
+            # TODO: Use the mask here.
+            res = demean(self.fe, [self.endog, self.shock, self.exog], mask=self.mask)
             self.endog, self.shock, self.exog = res
 
         # Build the stacked arrays
         T, k = self.exog.shape
-        use = []
+        omit_obs = []
         Y = []
         for t in range(T):
             ty = self.endog[t : min(T, t + self.H + 1)]
             if t + self.H + 1 >= T:
-                tu = np.arange(t, t + self.H + 1) < T
+                to = np.arange(t, t + self.H + 1) >= T
                 ty = np.concat((ty, np.zeros(self.H + 1 - (T - t))))
                 assert ty.shape[0] == self.H + 1
             else:
-                tu = np.full_like(ty, True)
+                to = np.full(ty.shape, False)
+            # Apply the mask to y values
+            if self.mask is not None and self.mask_type in ("y", "both"):
+                temp_mask = self.mask[t : min(T, t + self.H + 1)]
+                if t + self.H + 1 >= T:
+                    temp_mask = np.concat(
+                        (temp_mask, np.full(self.H + 1 - (T - t), False))
+                    )
+                if self.mask_any_prev_h:
+                    temp_mask = temp_mask.cumsum() > 0
+                to = to | temp_mask
             Y.append(ty)
-            use.append(tu)
+            omit_obs.append(to)
         self._Ys = np.stack(Y, axis=0)
         exog = self.exog.reshape((T, 1, k))
         exog = np.repeat(exog, self.H + 1, axis=1)
         shock = np.einsum("hv,t->thv", B, self.shock)
         X_s = np.concat((shock, exog), axis=2)
         # Set the X matrix to zero for all values out of the bound
-        use = np.stack(use, axis=0).reshape((T, self.H + 1, 1)).astype(bool)
-        self._use = use
-        self._Xs = np.where(self._use, X_s, np.zeros_like(X_s))
+        omit_obs = np.stack(omit_obs, axis=0).reshape((T, self.H + 1, 1)).astype(bool)
+        # Apply the mask to X values
+        if self.mask is not None and self.mask_type in ("x", "both"):
+            temp_mask = np.repeat(self.mask.reshape((T, 1, 1)), self.H + 1, axis=1)
+            omit_obs = omit_obs | temp_mask
+        self._omit = omit_obs
+        self._Xs = np.where(self._omit, 0.0, X_s)
 
         Y = self._Ys.flatten()
         X = self._Xs.reshape(T * (self.H + 1), X_s.shape[2])
-        Y = Y[use.flatten()]
-        X = X[use.flatten(), :]
+        Y = Y[~omit_obs.flatten()]
+        X = X[~omit_obs.flatten(), :]
 
         # Build the penalty matrix
         # For now only identity penalty is implemented
