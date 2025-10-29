@@ -3,23 +3,19 @@ from functools import cached_property
 
 import numpy as np
 
+from smoothlp.models import AbstractLocalProjection
 from smoothlp.utils import bspline, demean
 
 
-class SmoothLocalProjection:
-    endog: np.ndarray
-    exog: np.ndarray
-    shock: np.ndarray
+class SmoothLocalProjection(AbstractLocalProjection):
     fe: tuple[np.ndarray] | np.ndarray | None
 
-    H: int
     p: int
     n_diff: int
 
-    mask: np.ndarray | None
-    mask_type: str
     mask_any_prev_h: bool
 
+    # These are computed during the model fitting.
     _Xs: np.ndarray | None
     _Ys: np.ndarray | None
     _omit: np.ndarray | None
@@ -38,10 +34,7 @@ class SmoothLocalProjection:
         mask_type: str = "both",
         mask_any_prev_h: bool = True,
     ):
-        self.endog = endog
-        self.shock = shock
-        self.exog = exog
-        assert len(self.shock.shape) == 1
+        super().__init__(endog, shock, exog, H, mask, mask_type)
         if fe is None:
             self.fe = ()
         else:
@@ -49,13 +42,9 @@ class SmoothLocalProjection:
                 self.fe = (fe,)
             else:
                 self.fe = fe
-        self.H = H
         self.p = p
         self.n_diff = n_diff
 
-        assert mask_type in ("x", "y", "both")
-        self.mask = mask
-        self.mask_type = mask_type
         self.mask_any_prev_h = mask_any_prev_h
 
         self._Xs = None
@@ -66,8 +55,8 @@ class SmoothLocalProjection:
     def fit(
         self,
         lam: float | None,
-        lam_grid_lower: float = -3.0,
-        lam_grid_upper: float = 3.0,
+        lam_grid_lower: float = -5.0,
+        lam_grid_upper: float = 5.0,
         lam_grid_size: int = 10_000,
     ):
         # First create the splines. Indexed by horizon x basis function
@@ -75,7 +64,6 @@ class SmoothLocalProjection:
         B = np.array([bspline(self.p, knots, x) for x in range(self.H + 1)])
 
         if len(self.fe) > 0:
-            # TODO: Use the mask here.
             res = demean(self.fe, [self.endog, self.shock, self.exog], mask=self.mask)
             self.endog, self.shock, self.exog = res
 

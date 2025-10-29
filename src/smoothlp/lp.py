@@ -1,10 +1,10 @@
-from typing import NamedTuple
-
 import numpy as np
 from statsmodels import api as sm
 
+from smoothlp.models import AbstractLocalProjection, AbstractLocalProjectionResult
 
-class LocalProjection:
+
+class LocalProjection(AbstractLocalProjection):
     """Local Projection
 
     Run the standard local projection from Jorda 2006.
@@ -25,50 +25,16 @@ class LocalProjection:
     instead of `lpirfs`.
     """
 
-    endog: np.ndarray
-    exog: np.ndarray
-    shock: np.ndarray
-
-    H: int
-
-    mask: np.ndarray | None
-    mask_type: str
-
-    def __init__(
-        self,
-        endog,
-        exog,
-        shock,
-        H,
-        mask: np.ndarray | None = None,
-        mask_type: str = "both",
-    ):
-        assert len(endog.shape) == 1
-        assert len(exog.shape) == 2
-        assert len(shock.shape) == 1
-
-        assert endog.shape[0] == exog.shape[0]
-        assert endog.shape[0] == shock.shape[0]
-        assert mask is None or endog.shape == mask.shape
-
-        assert mask_type in ("x", "y", "both"), (
-            f"Mask type '{mask_type}' not recognized"
-        )
-
-        self.endog = endog
-        self.exog = exog
-        self.shock = shock
-        self.H = H
-        self.mask = mask
-        self.mask_type = mask_type
-
-    def fit(self, vcov="HC3", engine="np"):
+    def fit(self, vcov="HC3", engine="np") -> "LocalProjectionResult":
         assert engine in ("np", "sm"), f"Engine '{engine}' not recognised."
         assert vcov in ("non-robust", "HC1", "HC3", "HAC"), (
             f"vcov '{vcov}' not recognised."
         )
 
-        X = np.concatenate((self.shock.reshape(-1, 1), self.exog), axis=1)
+        if self.exog is not None:
+            X = np.concatenate((self.shock.reshape(-1, 1), self.exog), axis=1)
+        else:
+            X = self.shock.reshape((-1, 1))
 
         if engine == "np":
             engine_func = LocalProjection._estimation_np
@@ -83,18 +49,7 @@ class LocalProjection:
             self.mask_type,
         )
 
-        return LocalProjectionResult(
-            self,
-            # The data objects
-            self.endog,
-            self.exog,
-            self.shock,
-            self.H,
-            # Estimated objects
-            coef,
-            vcov_vals,
-            vcov,
-        )
+        return LocalProjectionResult(self, coef, vcov_vals, vcov)
 
     @staticmethod
     def _estimation_np(
@@ -216,22 +171,5 @@ class LocalProjection:
         return coef, vcov
 
 
-class LocalProjectionResult(NamedTuple):
-    model: LocalProjection
-    endog: np.ndarray
-    exog: np.ndarray
-    shock: np.ndarray
-
-    H: int
-
-    coefs: np.ndarray
-    vcov: np.ndarray
-    vcov_type: str
-
-    @property
-    def irf(self):
-        return self.coefs[:, 0]
-
-    @property
-    def se(self):
-        return np.sqrt(self.vcov[:, 0, 0])
+class LocalProjectionResult(AbstractLocalProjectionResult):
+    pass
