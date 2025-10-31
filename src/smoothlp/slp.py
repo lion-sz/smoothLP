@@ -115,11 +115,11 @@ class SmoothLocalProjection(AbstractLocalProjection):
         P = np.zeros((X.shape[1], X.shape[1]))
         D = np.eye(self.H + 1)
         for i in range(2):
-            D = np.diff(D, axis=1)
-        P[: (self.H + 1), : (self.H + 1)] = D @ D.T
+            D = np.diff(D, axis=0)
+        P[: (self.H + 1), : (self.H + 1)] = D.T @ D
 
         if lam is None:
-            lam, values = SmoothLocalProjection._tune_lambda(
+            lam, tune_trace = SmoothLocalProjection._tune_lambda(
                 X,
                 Y,
                 P,
@@ -128,6 +128,8 @@ class SmoothLocalProjection(AbstractLocalProjection):
                 lam_grid_upper,
                 lam_grid_size,
             )
+        else:
+            tune_trace = None
         # Compute the coefficients
         theta_hat = np.linalg.inv(X.T @ X + lam * P) @ X.T @ Y
         self._us = self._Ys - np.einsum("thk,k->th", self._Xs, theta_hat)
@@ -138,6 +140,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
             P,
             lam,
             theta_hat,
+            tune_trace,
         )
 
     @staticmethod
@@ -183,7 +186,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         def eval_f(lam):
             d = 1 / (1 + lam * s)
             bd = b * d
-            rss = ypy - 2 * b.T @ bd + bd.T @ ApA @ b
+            rss = ypy - 2 * b.T @ bd + bd.T @ ApA @ bd
             dfit = np.sum(d)
             gcv = rss / (1 - dfit / n) ** 2
             return rss, gcv, dfit
@@ -210,13 +213,15 @@ class SmoothLocalProjectionResult:
 
     lam: float
     theta_hat: np.ndarray
+    tune_trace: np.ndarray | None
 
-    def __init__(self, model, knots, P, lam, theta_hat):
+    def __init__(self, model, knots, P, lam, theta_hat, tune_trace):
         self.model = model
         self.knots = knots
         self.P = P
         self.lam = lam
         self.theta_hat = theta_hat
+        self.tune_trace = tune_trace
 
     @property
     def H(self):
