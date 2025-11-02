@@ -1,0 +1,56 @@
+runner:
+  n_runs: 1000
+  key: 12
+
+  n: 2000
+  h: 90
+
+  data:
+    - white_noise:
+        GaussianNoise:
+          sigma: 0.05
+    - AR1:
+        AR1:
+          rho: 0.5
+          sc:
+            GaussianNoise:
+              sigma: 0.05
+  irf:
+    - ZeroIRF:
+        ZeroIRF:
+  shock:
+    - Sparse45:
+        SparseShock:
+          freq: 45
+          sc:
+            GaussianShock:
+              mu: 0.0
+              sigma: 1.0
+    - Sparse30:
+        SparseShock:
+          freq: 30
+          sc:
+            GaussianShock:
+              mu: 0.0
+              sigma: 1.0
+    - Normal:
+        GaussianShock:
+          mu: 0.0
+          sigma: 1.0
+  combination: linear_combination
+  fixed_kwargs:
+    smooth_window: 30
+    smooth: false
+  model_kwargs:
+    - HAC_30lags:
+        vcov: HAC
+        lags: 30
+    - HAC_no_lags:
+        vcov: HAC
+        lags: 0
+    - HC3_30lags:
+        vcov: HC3
+        lags: 30
+    - HC3_no_lags:
+        vcov: HC3
+        lags: 0

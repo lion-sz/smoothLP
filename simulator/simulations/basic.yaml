@@ -1,0 +1,19 @@
+basic_zero_irf:
+  n: 2000
+  h: 30
+  data:
+    AR1:
+      rho: 0.5
+      sc:
+        GaussianNoise:
+          sigma: 0.05
+  irf:
+    ZeroIRF:
+  shock:
+    SparseShock:
+      sc:
+        GaussianShock:
+          mu: 0.0
+          sigma: 1.0
+      freq: 60
+  combination: linear_combination

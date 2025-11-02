@@ -3,6 +3,7 @@ from typing import Callable
 from tqdm import tqdm
 from matplotlib import pyplot as plt
 from box import Box, BoxList
+import numpy as np
 import jax
 from jax import Array, numpy as jnp, random as jrng
 
@@ -63,11 +64,12 @@ class Simulation:
 
         @jax.jit
         def sample(key: Array):
-            data = self.data_component.generate(data_params, key, self.n)
+            kd, ks, ki = jrng.split(key, 3)
+            data = self.data_component.generate(data_params, kd, self.n)
             shocks = self.shock_component.generate(
-                shock_params, key, self.n + 2 * self.h
+                shock_params, ks, self.n + 2 * self.h
             )
-            irf = self.irf_component.generate(irf_params, key, self.h)
+            irf = self.irf_component.generate(irf_params, ki, self.h)
             combined = linear_combination(self.n, self.h, data, irf, shocks)
 
             return combined, shocks[self.h : (self.n + self.h)], irf
@@ -76,26 +78,31 @@ class Simulation:
 
     def run(self, model_fn, n, key):
         sample = self.make_sampler()
-        err = []
-        sqr_err = []
-        pointwise_t = []
+        ests = []
+        ses = []
+        irfs = []
         keys = jrng.split(key, n)
         for i in tqdm(range(n), ncols=100):
             Y, s, irf = sample(keys[i])
             est, se = model_fn(Y, s, self.h)
-            # Compute statistics
-            t_err = est - irf
-            err.append(t_err)
-            sqr_err.append(jnp.square(t_err))
-            pointwise_t.append(t_err / se)
-        err = jnp.stack(err, axis=-1)
-        sqr_err = jnp.stack(sqr_err, axis=-1)
-        pointwise_t = jnp.stack(pointwise_t, axis=-1)
-        results = {"err": err, "sqr_err": sqr_err, "pointwise_t": pointwise_t}
-        results["bias"] = jnp.mean(err, axis=1)
-        results["mse"] = jnp.mean(sqr_err, axis=1)
-        results["share_rejected_90"] = jnp.mean(jnp.abs(pointwise_t) >= 1.64, axis=1)
-        results["share_rejected_95"] = jnp.mean(jnp.abs(pointwise_t) >= 1.96, axis=1)
+            irfs.append(irf)
+            ests.append(est)
+            ses.append(se)
+        ests = np.stack(ests, axis=0)
+        irfs = np.stack(irfs, axis=0)
+        ses = np.stack(ses, axis=0)
+        t = ests / ses
+        results = {
+            "irf": irfs,
+            "est": ests,
+            "se": ses,
+            "pointwise_t": t,
+            "bias": np.mean(ests - irfs, axis=0),
+            "mse": np.mean(np.square(ests - irfs), axis=0),
+            "share_rejected_90": np.mean(np.abs(t) >= 1.64, axis=0),
+            "share_rejected_95": np.mean(np.abs(t) >= 1.95, axis=0),
+        }
+        results = {k: np.array(v) for k, v in results.items()}
         return results
 
     @staticmethod
