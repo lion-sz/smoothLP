@@ -3,3 +3,6 @@ scripts
 playground_*
 results
 simulations
+**/profile_*.txt
+**/profile_output.lprof
+

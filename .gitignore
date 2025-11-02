@@ -4,4 +4,6 @@ external_data
 references
 .venv
 scripts
+**/profile_*.txt
+**/profile_output.lprof
 

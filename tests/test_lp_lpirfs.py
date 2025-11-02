@@ -54,9 +54,12 @@ def test_no_control_non_robust(interest_data_no_controls, interest_results):
     coef, se = interest_results
 
     res_np = LocalProjection(Y, shock, X, 12).fit(vcov="non-robust", engine="np")
+    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="non-robust", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_np.se, se)
+    npt.assert_allclose(res_jax.coef, res_np.coef, rtol=1e-5)
+    npt.assert_allclose(res_jax.vcov, res_np.vcov, rtol=1e-5)
 
 
 def test_no_control_hc1(interest_data_no_controls, interest_results):
@@ -65,10 +68,13 @@ def test_no_control_hc1(interest_data_no_controls, interest_results):
 
     res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="np")
     res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="sm")
+    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_sm.coef, res_np.coef)
     npt.assert_allclose(res_sm.vcov, res_np.vcov)
+    npt.assert_allclose(res_jax.coef, res_np.coef, rtol=1e-5)
+    npt.assert_allclose(res_jax.vcov, res_np.vcov, rtol=1e-5)
 
 
 def test_no_control_hc3(interest_data_no_controls, interest_results):
@@ -77,10 +83,13 @@ def test_no_control_hc3(interest_data_no_controls, interest_results):
 
     res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="np")
     res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="sm")
+    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_sm.coef, res_np.coef)
     npt.assert_allclose(res_sm.vcov, res_np.vcov)
+    npt.assert_allclose(res_jax.coef, res_np.coef, rtol=1e-5)
+    npt.assert_allclose(res_jax.vcov, res_np.vcov, rtol=1e-5)
 
 
 def test_no_control_hac(interest_data_no_controls, interest_results_nw):
@@ -92,11 +101,14 @@ def test_no_control_hac(interest_data_no_controls, interest_results_nw):
 
     res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="np")
     res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="sm")
+    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_np.se, se)
     npt.assert_allclose(res_sm.coef, res_np.coef)
     npt.assert_allclose(res_np.vcov, res_sm.vcov)
+    npt.assert_allclose(res_jax.coef, res_np.coef, rtol=1e-5)
+    npt.assert_allclose(res_jax.vcov, res_np.vcov, rtol=1e-5)
 
 
 def test_no_control_non_robust_l4(interest_data_no_controls, interest_results_lags4):
@@ -106,9 +118,12 @@ def test_no_control_non_robust_l4(interest_data_no_controls, interest_results_la
     coef, se = interest_results_lags4
 
     res_np = LocalProjection(Y, shock, X, 12).fit(vcov="non-robust", engine="np")
+    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="non-robust", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_np.se, se)
+    npt.assert_allclose(res_jax.coef, res_np.coef, atol=1e-5, rtol=1e-5)
+    npt.assert_allclose(res_jax.vcov, res_np.vcov, atol=1e-5, rtol=1e-5)
 
 
 def test_no_control_hc1_l4(interest_data_no_controls, interest_results_lags4):
@@ -119,10 +134,13 @@ def test_no_control_hc1_l4(interest_data_no_controls, interest_results_lags4):
 
     res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="np")
     res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="sm")
+    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_sm.coef, res_np.coef)
     npt.assert_allclose(res_sm.vcov, res_np.vcov)
+    npt.assert_allclose(res_jax.coef, res_np.coef, atol=1e-5, rtol=1e-5)
+    npt.assert_allclose(res_jax.vcov, res_np.vcov, atol=1e-5, rtol=1e-5)
 
 
 def test_no_control_hc3_l4(interest_data_no_controls, interest_results_lags4):
@@ -133,10 +151,13 @@ def test_no_control_hc3_l4(interest_data_no_controls, interest_results_lags4):
 
     res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="np")
     res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="sm")
+    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_sm.coef, res_np.coef)
     npt.assert_allclose(res_sm.vcov, res_np.vcov)
+    npt.assert_allclose(res_jax.coef, res_np.coef, atol=1e-5, rtol=1e-5)
+    npt.assert_allclose(res_jax.vcov, res_np.vcov, atol=1e-5, rtol=1e-5)
 
 
 def test_no_control_hac_l4(interest_data_no_controls, interest_results_nw_lags4):
@@ -150,8 +171,11 @@ def test_no_control_hac_l4(interest_data_no_controls, interest_results_nw_lags4)
 
     res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="np")
     res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="sm")
+    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_np.se, se)
     npt.assert_allclose(res_sm.coef, res_np.coef)
     npt.assert_allclose(res_np.vcov, res_sm.vcov)
+    npt.assert_allclose(res_jax.coef, res_np.coef, atol=1e-5, rtol=1e-5)
+    npt.assert_allclose(res_jax.vcov, res_np.vcov, atol=1e-5, rtol=1e-5)
