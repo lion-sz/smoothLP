@@ -1,0 +1,16 @@
+zero_dense:
+  n: 200
+  h: 20
+  data:
+    AR1:
+      rho: 0.5
+      sc:
+        GaussianNoise:
+          sigma: 0.1
+  irf:
+    ZeroIRF:
+  shock:
+    GaussianShock:
+      mu: 0.0
+      sigma: 1.0
+  combination: linear_combination

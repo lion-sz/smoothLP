@@ -1142,6 +1142,9 @@ examples = [
     { name = "matplotlib" },
     { name = "polars" },
 ]
+simulator = [
+    { name = "simulator" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -1158,9 +1161,10 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.3.4" },
     { name = "polars", marker = "extra == 'examples'", specifier = ">=1.34.0" },
     { name = "scipy", specifier = ">=1.16.2" },
+    { name = "simulator", marker = "extra == 'simulator'", editable = "simulator" },
     { name = "statsmodels", specifier = ">=0.14.5" },
 ]
-provides-extras = ["examples", "cuda"]
+provides-extras = ["examples", "cuda", "simulator"]
 
 [package.metadata.requires-dev]
 dev = [
