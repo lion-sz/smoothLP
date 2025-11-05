@@ -3,9 +3,8 @@ from functools import partial
 import numpy as np
 from statsmodels import api as sm
 from scipy import linalg as sla
-from line_profiler import profile
 import jax
-from jax import numpy as jnp, lax
+from jax import lax, numpy as jnp
 
 from smoothlp.models import AbstractLocalProjection, AbstractLocalProjectionResult
 
@@ -38,7 +37,10 @@ class LocalProjection(AbstractLocalProjection):
         )
 
         if self.exog is not None:
-            X = np.concatenate((self.shock.reshape(-1, 1), self.exog), axis=1)
+            if engine == "jax":
+                X = jnp.concatenate((self.shock.reshape(-1, 1), self.exog), axis=1)
+            else:
+                X = np.concatenate((self.shock.reshape(-1, 1), self.exog), axis=1)
         else:
             X = self.shock.reshape((-1, 1))
 
@@ -57,13 +59,10 @@ class LocalProjection(AbstractLocalProjection):
             self.mask,
             self.mask_type,
         )
-        if engine == "jax":
-            coef, vcov_vals = np.array(coef), np.array(vcov_vals)
 
         return LocalProjectionResult(self, coef, vcov_vals, vcov)
 
     @staticmethod
-    @profile
     def _estimation_np(
         Y: np.ndarray,
         X: np.ndarray,
@@ -110,7 +109,7 @@ class LocalProjection(AbstractLocalProjection):
                         @ est_mat.T
                     )
                 elif vcov_type == "HC3":
-                    ktt = np.einsum("ij,ji->i", X, est_mat)
+                    ktt = np.einsum("ij,ji->i", tx, est_mat)
                     u_star = np.square(resid / (1 - ktt)).reshape((1, t))
                     vcov[h, :, :] = (est_mat * u_star) @ est_mat.T
                 elif vcov_type == "HAC":
@@ -126,7 +125,6 @@ class LocalProjection(AbstractLocalProjection):
         return coef, vcov
 
     @staticmethod
-    @profile
     def _vcov_nw(X: np.ndarray, XpX_inv: np.ndarray, resid: np.ndarray, lags: int):
         T, k = X.shape
 
@@ -154,6 +152,7 @@ class LocalProjection(AbstractLocalProjection):
         mask: np.ndarray | None,
         mask_type: str = "both",
     ):
+        assert mask is None, "Mask not yet fully supported"
         T, k = X.shape
         XpX = X.T @ X
         XpX_end = jnp.einsum("ti,tj->tij", X[(-H - 1) :, :], X[(-H - 1) :, :])
@@ -165,10 +164,7 @@ class LocalProjection(AbstractLocalProjection):
             sub_x = jnp.arange(H + 1) >= H + 1 - h
             tmask = mask.at[-(H + 1) :].set((~sub_x).astype(float))
             tXpX = XpX - jnp.sum(XpX_end * sub_x.reshape((H + 1, 1, 1)), axis=0)
-            # Iteration
-            U = jax.scipy.linalg.cholesky(tXpX)
-            Uinv = jnp.linalg.inv(U)
-            XpX_inv = Uinv @ Uinv.T
+            XpX_inv = jnp.linalg.pinv(tXpX, hermitian=True)
             est_mat = XpX_inv @ X.T
             ty = lax.dynamic_slice_in_dim(Y, h, T)
             beta = est_mat @ ty

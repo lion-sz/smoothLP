@@ -48,7 +48,7 @@ class SimulationRunner:
 
         return configs
 
-    def run(self, out_path: pathlib.Path, clean_out: bool = True):
+    def run(self, out_path: pathlib.Path, clean_out: bool = True, use_jax: bool = True):
         out_path.mkdir(exist_ok=True)
         if clean_out:
             for f in out_path.glob("*"):
@@ -65,8 +65,9 @@ class SimulationRunner:
             sim = Simulation(conf[0])
             kwargs = fixed_kwargs | conf[1]
             _mod_fn = partial(self._model_fn, **kwargs)
-            res = sim.run(_mod_fn, self._conf.n_runs, key)
+            res = sim.run(_mod_fn, self._conf.n_runs, key, use_jax=use_jax)
             fig = sim.plot(res)
             fig.savefig(out_path / f"{name}.png")
             plt.close(fig)
             np.save(out_path / name, res)
+            conf[0].to_yaml(filename=out_path / f"{name}.yaml")

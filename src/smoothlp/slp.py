@@ -2,9 +2,25 @@ import warnings
 from functools import cached_property
 
 import numpy as np
+from scipy import linalg as sla
+import jax
+from jax import Array, lax, numpy as jnp, scipy as jsp
+from line_profiler import profile
 
 from smoothlp.models import AbstractLocalProjection
 from smoothlp.utils import bspline, demean
+
+
+def invert(X):
+    U = sla.cholesky(X)
+    U_inv = sla.solve_triangular(U, np.eye(X.shape[0]))
+    return U_inv @ U_inv.T
+
+
+def invert_jax(X):
+    U = jsp.linalg.cholesky(X)
+    U_inv = jsp.linalg.solve_triangular(U, jnp.eye(X.shape[0]))
+    return U_inv @ U_inv.T
 
 
 class SmoothLocalProjection(AbstractLocalProjection):
@@ -20,6 +36,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
     _Ys: np.ndarray | None
     _omit: np.ndarray | None
     _us: np.ndarray | None
+    _engine: str | None
 
     def __init__(
         self,
@@ -51,14 +68,18 @@ class SmoothLocalProjection(AbstractLocalProjection):
         self._Ys = None
         self._omit = None
         self._us = None
+        self._engine = None
 
+    @profile
     def fit(
         self,
         lam: float | None,
         lam_grid_lower: float = -5.0,
         lam_grid_upper: float = 5.0,
         lam_grid_size: int = 10_000,
+        engine: str = "np",
     ):
+        self._engine = engine
         # First create the splines. Indexed by horizon x basis function
         knots = np.arange(-2, self.H + 3).astype(np.float64)
         B = np.array([bspline(self.p, knots, x) for x in range(self.H + 1)])
@@ -66,6 +87,35 @@ class SmoothLocalProjection(AbstractLocalProjection):
         if len(self.fe) > 0:
             res = demean(self.fe, [self.endog, self.shock, self.exog], mask=self.mask)
             self.endog, self.shock, self.exog = res
+
+        if engine == "jax":
+            X, Y, P, mask, u, theta_hat, lam, tune_trace = (
+                SmoothLocalProjection._fit_jax(
+                    B,
+                    self.endog,
+                    self.shock,
+                    self.exog,
+                    self.mask,
+                    self.mask_type,
+                    self.H,
+                    lam,
+                    lam_grid_lower,
+                    lam_grid_upper,
+                    lam_grid_size,
+                )
+            )
+            self._Ys = Y
+            self._Xs = X
+            self._omit = ~mask
+            self._us = u
+            return SmoothLocalProjectionResult(
+                self,
+                knots,
+                P,
+                lam,
+                theta_hat,
+                tune_trace,
+            )
 
         # Build the stacked arrays
         T, k = self.exog.shape
@@ -123,6 +173,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
                 X,
                 Y,
                 P,
+                Y.shape[0],
                 self.H + 1,
                 lam_grid_lower,
                 lam_grid_upper,
@@ -131,7 +182,9 @@ class SmoothLocalProjection(AbstractLocalProjection):
         else:
             tune_trace = None
         # Compute the coefficients
-        theta_hat = np.linalg.inv(X.T @ X + lam * P) @ X.T @ Y
+        XtX_lam = X.T @ X + lam * P
+        XtX_lam_inv = invert(XtX_lam)
+        theta_hat = XtX_lam_inv @ (X.T @ Y)
         self._us = self._Ys - np.einsum("thk,k->th", self._Xs, theta_hat)
 
         return SmoothLocalProjectionResult(
@@ -144,28 +197,37 @@ class SmoothLocalProjection(AbstractLocalProjection):
         )
 
     @staticmethod
+    @profile
     def _tune_lambda(
         X,
         y,
         P,
+        n: int,
         k_shock: int,
         lam_grid_lower: float,
         lam_grid_upper: float,
         lam_grid_size: int,
+        use_jax: bool = False,
     ):
         """Tune lambda using Demmler-Reinsch Orthogonalization
 
         This proceedure was adopted from the LocalProjections Julia package.
         See Rupper (2003), appendix B.1.1 for a reference.
         """
-        n = y.shape[0]
+        if use_jax:
+            lib = jnp
+            sla_lib = jsp.linalg
+        else:
+            lib = np
+            sla_lib = sla
 
         # First check if I should parital out some regressors
         if k_shock < X.shape[1]:
             exog = X[:, k_shock:]
             X = X[:, :k_shock]
 
-            EpE_inv = np.linalg.inv(exog.T @ exog)
+            EpE = exog.T @ exog
+            EpE_inv = invert_jax(EpE) if use_jax else invert(EpE)
             X = X - (exog @ EpE_inv) @ (exog.T @ X)
             y = y - (exog @ EpE_inv) @ (exog.T @ y)
 
@@ -173,37 +235,123 @@ class SmoothLocalProjection(AbstractLocalProjection):
 
         # Set up the orthogonalization
         XpX = X.T @ X
-        R = np.linalg.cholesky(XpX, upper=True)
-        Rinv = np.linalg.inv(R)
+        R = sla_lib.cholesky(XpX, lower=False)
+        Rinv = sla_lib.solve_triangular(R, lib.eye(k_shock))
         RTinv_P_Rinv = Rinv.T @ P @ Rinv
-        s, U = np.linalg.eig(RTinv_P_Rinv + 1e-9 * P)
+        s, U = lib.linalg.eigh(RTinv_P_Rinv + 1e-9 * P)
         A = X @ Rinv @ U
         b = A.T @ y
 
-        ypy = np.sum(np.square(y))
+        ypy = lib.sum(lib.square(y))
         ApA = A.T @ A
 
         def eval_f(lam):
             d = 1 / (1 + lam * s)
             bd = b * d
             rss = ypy - 2 * b.T @ bd + bd.T @ ApA @ bd
-            dfit = np.sum(d)
+            dfit = lib.sum(d)
             gcv = rss / (1 - dfit / n) ** 2
-            return rss, gcv, dfit
+            return lib.array([rss, gcv, dfit])
 
         # Build the grid and map the step function over it
-        lam_grid = np.exp(np.linspace(lam_grid_lower, lam_grid_upper, lam_grid_size))
-        values = np.array(list(map(eval_f, lam_grid)))
+        lam_grid = lib.exp(lib.linspace(lam_grid_lower, lam_grid_upper, lam_grid_size))
+        if use_jax:
+            values = jax.vmap(eval_f)(lam_grid)
+        else:
+            values = np.array(list(map(eval_f, lam_grid)))
 
-        argmin_gcv = np.argmin(values[:, 1])
+        argmin_gcv = lib.argmin(values[:, 1])
         min_gcv = lam_grid[argmin_gcv]
 
-        if argmin_gcv == 0 or (argmin_gcv == lam_grid_size - 1):
-            warnings.warn(
-                f"Selected optimal penalty at the edge of the grid: {min_gcv} (pos {argmin_gcv})."
-            )
+        if not use_jax:
+            if argmin_gcv == 0 or (argmin_gcv == lam_grid_size - 1):
+                warnings.warn(
+                    f"Selected optimal penalty at the edge of the grid: {min_gcv} (pos {argmin_gcv})."
+                )
 
         return min_gcv, values
+
+    @staticmethod
+    def _fit_jax(
+        B,
+        endog,
+        shock,
+        exog,
+        input_mask,
+        mask_type,
+        H: int,
+        lam: float,
+        lam_grid_lower: float,
+        lam_grid_upper: float,
+        lam_grid_size: int,
+    ):
+        # Assumes that the inputs are already demeaned.
+        T, k = exog.shape
+
+        # First create the stacked Y.
+        y = jnp.repeat(endog, H + 1, axis=0).reshape((T, H + 1))
+        Y = lax.scan(
+            lambda _, v: (None, jnp.roll(v[0], -v[1])),
+            None,
+            (y.T, np.arange(H + 1)),
+        )[1].T
+        # Build the mask for out of bounds observations.
+        mask = np.arange(T).reshape((T, 1)) + np.arange(H + 1).reshape((1, H + 1))
+        mask = mask < T
+        # Apply the covid mask
+        if input_mask is not None:
+            if mask_type in ("x", "both"):
+                mask = mask & input_mask.reshape((T, 1))
+            if mask_type in ("y", "both"):
+                input_mask = jnp.repeat(input_mask, H + 1, axis=0).reshape((T, H + 1))
+                input_mask = lax.scan(
+                    lambda _, v: (None, jnp.roll(v[0], -v[1])),
+                    None,
+                    (input_mask.T, np.arange(H + 1)),
+                )[1].T
+                mask = mask & input_mask
+        # Build the stacked arrays
+        X = exog.reshape((T, 1, k))
+        X = jnp.repeat(X, H + 1, axis=1)
+        s = B[jnp.newaxis, ...] * shock.reshape((T, 1, 1))
+        X = jnp.concat((s, X), axis=2)
+        # Apply the mask
+        X = X * mask[..., jnp.newaxis]
+        Y = Y * mask
+
+        Y_flat = Y.flatten()
+        X_flat = X.reshape((T * (H + 1)), H + 1 + k)
+
+        # Build the penalty matrix
+        P = jnp.zeros((H + 1 + k, H + 1 + k))
+        D = jnp.eye(H + 1)
+        for i in range(2):
+            D = jnp.diff(D, axis=0)
+        P = P.at[: (H + 1), : (H + 1)].set(D.T @ D)
+
+        # Lambda tuning
+        if lam is None:
+            lam, tune_trace = SmoothLocalProjection._tune_lambda(
+                X_flat,
+                Y_flat,
+                P,
+                jnp.sum(mask),
+                H + 1,
+                lam_grid_lower,
+                lam_grid_upper,
+                lam_grid_size,
+                True,
+            )
+        else:
+            tune_trace = None
+
+        # Compute the coefficients
+        XpX_lam = X_flat.T @ X_flat + lam * P
+        XpX_lam_inv = invert_jax(XpX_lam)
+        theta_hat = XpX_lam_inv @ X_flat.T @ Y_flat
+        u = Y - jnp.einsum("thk,k->th", X, theta_hat)
+
+        return X, Y, P, mask[..., jnp.newaxis], u, theta_hat, lam, tune_trace
 
 
 class SmoothLocalProjectionResult:
@@ -239,29 +387,73 @@ class SmoothLocalProjectionResult:
 
     @cached_property
     def vcov_nw(self):
-        X = self.model._Xs
-        u = self.model._us
-        T, _, k = X.shape
-        lags = self.H + 1
-        xpx1 = np.einsum("thi,thk->ik", X, X)
-        outer = xpx1 + 0.1 * self.lam * self.P
-        outer = np.linalg.inv(outer)
+        if self.model._engine == "jax":
+            return self._vcov_nw_jax(self.model._Xs, self.model._us, self.lam, self.P)
+        else:
+            return self._vcov_nw_inner(
+                self.model._Xs, self.model._us, self.lam, self.P, False
+            )
+
+    @staticmethod
+    @jax.jit
+    def _vcov_nw_jax(Xs, us, lam, P):
+        return SmoothLocalProjectionResult._vcov_nw_inner(Xs, us, lam, P, True)
+
+    @staticmethod
+    def _vcov_nw_inner(X, u, lam, P, use_jax=False):
+        np_lib = jnp if use_jax else np
+
+        T, lags = u.shape
+        k = X.shape[2]
+
+        xpx1 = np_lib.sum(np_lib.transpose(X, (0, 2, 1)) @ X, axis=0)
+        outer = xpx1 + 0.1 * lam * P
+        if use_jax:
+            outer = invert_jax(outer)
+        else:
+            outer = invert(outer)
         # Compute the Gammas
-        Xpu = np.einsum("thk,th->tk", X, u)
-        lrv = np.zeros((k, k))
-        for j in range(lags + 1):
-            Gamma = 1 / T * np.einsum("tk,ti->ki", Xpu[j:, ...], Xpu[: (T - j), ...])
-            if j == 0:
-                lrv += Gamma
-            else:
-                lrv += (1 - j / (lags + 1)) * (Gamma + Gamma.T)
+        Xpu = np_lib.einsum("thk,th->tk", X, u)
+        if use_jax:
+            Xpu = jnp.concat((jnp.zeros((lags, k)), Xpu), axis=0)
+
+            def f(lrv, h):
+                Gamma = (
+                    1
+                    / T
+                    * jnp.einsum(
+                        "tk,ti->ki",
+                        Xpu[lags : (lags + T), :],
+                        lax.dynamic_slice_in_dim(Xpu, lags - h, T),
+                    )
+                )
+                w = 1 - h / (lags + 1)
+                lrv += w * (Gamma + Gamma.T * (h > 0))
+                return lrv, None
+
+            lrv, _ = lax.scan(f, jnp.zeros((k, k)), jnp.arange(lags + 1))
+        else:
+            lrv = jnp.zeros((k, k))
+            for j in range(lags + 1):
+                Gamma = (
+                    1
+                    / T
+                    * np_lib.einsum("tk,ti->ki", Xpu[j:, ...], Xpu[: (T - j), ...])
+                )
+                if j == 0:
+                    lrv += Gamma
+                else:
+                    lrv += (1 - j / (lags + 1)) * (Gamma + Gamma.T)
         vcov_nw = T * outer @ lrv @ outer
         return vcov_nw
 
     @cached_property
-    def irf_se(self):
+    def se(self):
         vcov = (
             self.B @ self.vcov_nw[: (self.H + 1), : (self.H + 1)] @ self.B.transpose()
         )
-        se = np.sqrt(np.diag(vcov))
+        if isinstance(vcov, Array):
+            se = jnp.sqrt(jnp.diag(vcov))
+        else:
+            se = np.sqrt(np.diag(vcov))
         return se

@@ -1,4 +1,5 @@
 import numpy as np
+from jax import Array, numpy as jnp
 
 
 class AbstractLocalProjection:
@@ -72,4 +73,7 @@ class AbstractLocalProjectionResult:
 
     @property
     def se(self):
-        return np.sqrt(self.vcov[:, 0, 0])
+        if isinstance(self.vcov, Array):
+            return jnp.sqrt(self.vcov[:, 0, 0])
+        else:
+            return np.sqrt(self.vcov[:, 0, 0])

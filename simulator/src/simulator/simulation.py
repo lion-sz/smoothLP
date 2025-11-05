@@ -1,11 +1,12 @@
 from typing import Callable
+from datetime import datetime
 
 from tqdm import tqdm
 from matplotlib import pyplot as plt
 from box import Box, BoxList
 import numpy as np
 import jax
-from jax import Array, numpy as jnp, random as jrng
+from jax import Array, lax, numpy as jnp, random as jrng
 
 from simulator.components import AbstractComponent, component_map
 from simulator.irf import linear_combination
@@ -76,31 +77,56 @@ class Simulation:
 
         return sample
 
-    def run(self, model_fn, n, key):
+    def get_data(self, sim: int, n: int, key):
+        sample = self.make_sampler()
+        keys = jrng.split(key, n)
+        Y, s, irf = sample(keys[sim])
+        return Y, s, irf
+
+    def run(
+        self, model_fn, n, key, use_jax: bool = True, batch_size: int | None = None
+    ):
         sample = self.make_sampler()
         ests = []
         ses = []
         irfs = []
         keys = jrng.split(key, n)
-        for i in tqdm(range(n), ncols=100):
-            Y, s, irf = sample(keys[i])
+
+        def inner(key):
+            Y, s, irf = sample(key)
             est, se = model_fn(Y, s, self.h)
-            irfs.append(irf)
-            ests.append(est)
-            ses.append(se)
-        ests = np.stack(ests, axis=0)
-        irfs = np.stack(irfs, axis=0)
-        ses = np.stack(ses, axis=0)
+            return {
+                "est": est,
+                "se": se,
+                "irf": irf,
+            }
+
+        if use_jax:
+            s = datetime.now()
+            results = lax.map(inner, keys, batch_size=batch_size)
+            jax.block_until_ready(results)
+            elapsed = (datetime.now() - s).total_seconds()
+            print(f"Call took {elapsed:.2f} seconds ({elapsed / n:.4f} per iter).")
+        else:
+            temp = []
+            for i in tqdm(range(n)):
+                temp.append(inner(keys[i]))
+            results = {}
+            for k in temp[0].keys():
+                results[k] = jnp.stack([r[k] for r in temp])
+
+        irfs, ests, ses = results["irf"], results["est"], results["se"]
         t = ests / ses
-        results = {
-            "irf": irfs,
-            "est": ests,
-            "se": ses,
+        results = results | {
             "pointwise_t": t,
             "bias": np.mean(ests - irfs, axis=0),
             "mse": np.mean(np.square(ests - irfs), axis=0),
-            "share_rejected_90": np.mean(np.abs(t) >= 1.64, axis=0),
-            "share_rejected_95": np.mean(np.abs(t) >= 1.95, axis=0),
+            "share_null_rejected_68": np.mean(np.abs(t) >= 1.0, axis=0),
+            "share_null_rejected_90": np.mean(np.abs(t) >= 1.64, axis=0),
+            "share_null_rejected_95": np.mean(np.abs(t) >= 1.95, axis=0),
+            "share_irf_rejected_68": np.mean(np.abs(ests - irfs) / ses >= 1.0, axis=0),
+            "share_irf_rejected_90": np.mean(np.abs(ests - irfs) / ses >= 1.64, axis=0),
+            "share_irf_rejected_95": np.mean(np.abs(ests - irfs) / ses >= 1.95, axis=0),
         }
         results = {k: np.array(v) for k, v in results.items()}
         return results
@@ -116,9 +142,9 @@ class Simulation:
         plt.legend(loc="upper left")
 
         plt.sca(axes[1])
-        plt.plot(results["share_rejected_90"], label="rej 90")
+        plt.plot(results["share_irf_rejected_90"], label="rej 90")
         plt.axhline(y=0.1, linewidth=1, linestyle="--", color="black")
-        plt.plot(results["share_rejected_95"], label="rej 95")
+        plt.plot(results["share_irf_rejected_95"], label="rej 95")
         plt.axhline(y=0.05, linewidth=1, linestyle="--", color="black")
         plt.legend(loc="upper right")
         plt.tight_layout()

@@ -1144,9 +1144,6 @@ examples = [
 ]
 
 [package.dev-dependencies]
-cuda = [
-    { name = "jax", extra = ["cuda"] },
-]
 dev = [
     { name = "line-profiler" },
     { name = "pytest" },
@@ -1166,7 +1163,6 @@ requires-dist = [
 provides-extras = ["examples", "cuda"]
 
 [package.metadata.requires-dev]
-cuda = [{ name = "jax", extras = ["cuda"], specifier = ">=0.8.0" }]
 dev = [
     { name = "line-profiler", specifier = ">=5.0.0" },
     { name = "pytest", specifier = ">=8.4.2" },

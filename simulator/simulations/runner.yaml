@@ -8,16 +8,18 @@ runner:
   data:
     - white_noise:
         GaussianNoise:
-          sigma: 0.05
+          sigma: 0.2
     - AR1:
         AR1:
-          rho: 0.5
+          rho: 0.75
           sc:
             GaussianNoise:
-              sigma: 0.05
+              sigma: 0.1
   irf:
     - ZeroIRF:
         ZeroIRF:
+    - SinIRF:
+        SinIRF:
   shock:
     - Sparse45:
         SparseShock:
@@ -26,9 +28,9 @@ runner:
             GaussianShock:
               mu: 0.0
               sigma: 1.0
-    - Sparse30:
+    - Sparse20:
         SparseShock:
-          freq: 30
+          freq: 20
           sc:
             GaussianShock:
               mu: 0.0
@@ -40,17 +42,34 @@ runner:
   combination: linear_combination
   fixed_kwargs:
     smooth_window: 30
-    smooth: false
   model_kwargs:
-    - HAC_30lags:
+    - slp_90lags:
+        smooth_data: false
+        smooth_mod: true
         vcov: HAC
-        lags: 30
-    - HAC_no_lags:
-        vcov: HAC
-        lags: 0
-    - HC3_30lags:
-        vcov: HC3
-        lags: 30
-    - HC3_no_lags:
-        vcov: HC3
-        lags: 0
+        lags: 90
+    # - lp_HAC_90lags:
+    #     smooth_data: true
+    #     smooth_mod: false
+    #     vcov: HAC
+    #     lags: 90
+    # - lp_HAC_no_lags:
+    #     smooth_data: true
+    #     smooth_mod: false
+    #     vcov: HAC
+    #     lags: 0
+    # - lp_HC3_90lags:
+    #     smooth_data: true
+    #     smooth_mod: false
+    #     vcov: HC3
+    #     lags: 90
+    # - HC3_no_lags:
+    #     smooth_data: true
+    #     smooth_mod: false
+    #     vcov: HC3
+    #     lags: 0
+    # - lp_non_robust_90lags:
+    #     smooth_data: true
+    #     smooth_mod: false
+    #     vcov: non-robust
+    #     lags: 90

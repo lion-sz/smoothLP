@@ -19,6 +19,9 @@ examples = [
 cuda = [
     "jax[cuda]>=0.8.0",
 ]
+simulator = [
+    "simulator",
+]
 
 [build-system]
 requires = ["uv_build>=0.9.5,<0.10.0"]
@@ -34,3 +37,5 @@ dev = [
 members = [
     "simulator",
 ]
+[tool.uv.sources]
+simulator = {workspace = true}
