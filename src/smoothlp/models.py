@@ -1,7 +1,9 @@
+from dataclasses import dataclass
 import numpy as np
 from jax import Array, numpy as jnp
 
 
+@dataclass(init=True)
 class AbstractLocalProjection:
     endog: np.ndarray
     shock: np.ndarray
@@ -48,6 +50,7 @@ class AbstractLocalProjection:
         raise NotImplementedError()
 
 
+@dataclass
 class AbstractLocalProjectionResult:
     model: AbstractLocalProjection
 

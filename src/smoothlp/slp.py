@@ -1,11 +1,11 @@
 import warnings
 from functools import cached_property
+from dataclasses import dataclass
 
 import numpy as np
 from scipy import linalg as sla
 import jax
 from jax import Array, lax, numpy as jnp, scipy as jsp
-from line_profiler import profile
 
 from smoothlp.models import AbstractLocalProjection
 from smoothlp.utils import bspline, demean
@@ -23,6 +23,7 @@ def invert_jax(X):
     return U_inv @ U_inv.T
 
 
+@dataclass
 class SmoothLocalProjection(AbstractLocalProjection):
     fe: tuple[np.ndarray] | np.ndarray | None
 
@@ -30,13 +31,6 @@ class SmoothLocalProjection(AbstractLocalProjection):
     n_diff: int
 
     mask_any_prev_h: bool
-
-    # These are computed during the model fitting.
-    _Xs: np.ndarray | None
-    _Ys: np.ndarray | None
-    _omit: np.ndarray | None
-    _us: np.ndarray | None
-    _engine: str | None
 
     def __init__(
         self,
@@ -70,7 +64,6 @@ class SmoothLocalProjection(AbstractLocalProjection):
         self._us = None
         self._engine = None
 
-    @profile
     def fit(
         self,
         lam: float | None,
@@ -89,84 +82,98 @@ class SmoothLocalProjection(AbstractLocalProjection):
             self.endog, self.shock, self.exog = res
 
         if engine == "jax":
-            X, Y, P, mask, u, theta_hat, lam, tune_trace = (
-                SmoothLocalProjection._fit_jax(
-                    B,
-                    self.endog,
-                    self.shock,
-                    self.exog,
-                    self.mask,
-                    self.mask_type,
-                    self.H,
-                    lam,
-                    lam_grid_lower,
-                    lam_grid_upper,
-                    lam_grid_size,
-                )
-            )
-            self._Ys = Y
-            self._Xs = X
-            self._omit = ~mask
-            self._us = u
-            return SmoothLocalProjectionResult(
-                self,
-                knots,
-                P,
-                lam,
-                theta_hat,
-                tune_trace,
-            )
+            engine_fn = SmoothLocalProjection._fit_jax
+        else:
+            engine_fn = SmoothLocalProjection._fit_np
 
+        X, Y, P, omit, u, theta_hat, lam, tune_trace = engine_fn(
+            B,
+            self.endog,
+            self.shock,
+            self.exog,
+            self.mask,
+            self.mask_type,
+            self.mask_any_prev_h,
+            self.H,
+            lam,
+            lam_grid_lower,
+            lam_grid_upper,
+            lam_grid_size,
+        )
+        return SmoothLocalProjectionResult(
+            self,
+            knots,
+            P,
+            lam,
+            theta_hat,
+            tune_trace,
+            _Xs=np.where(omit, 0.0, X),
+            _Ys=Y,
+            _omit=omit,
+            _us=u,
+            _engine=engine,
+        )
+
+    @staticmethod
+    def _fit_np(
+        B,
+        endog,
+        shock,
+        exog,
+        mask,
+        mask_type: str,
+        mask_any_prev_h: bool,
+        H: int,
+        lam: float,
+        lam_grid_lower: float,
+        lam_grid_upper: float,
+        lam_grid_size: int,
+    ):
         # Build the stacked arrays
-        T, k = self.exog.shape
+        T, k = exog.shape
         omit_obs = []
         Y = []
         for t in range(T):
-            ty = self.endog[t : min(T, t + self.H + 1)]
-            if t + self.H + 1 >= T:
-                to = np.arange(t, t + self.H + 1) >= T
-                ty = np.concat((ty, np.zeros(self.H + 1 - (T - t))))
-                assert ty.shape[0] == self.H + 1
+            ty = endog[t : min(T, t + H + 1)]
+            if t + H + 1 >= T:
+                to = np.arange(t, t + H + 1) >= T
+                ty = np.concat((ty, np.zeros(H + 1 - (T - t))))
+                assert ty.shape[0] == H + 1
             else:
                 to = np.full(ty.shape, False)
             # Apply the mask to y values
-            if self.mask is not None and self.mask_type in ("y", "both"):
-                temp_mask = self.mask[t : min(T, t + self.H + 1)]
-                if t + self.H + 1 >= T:
-                    temp_mask = np.concat(
-                        (temp_mask, np.full(self.H + 1 - (T - t), False))
-                    )
-                if self.mask_any_prev_h:
+            if mask is not None and mask_type in ("y", "both"):
+                temp_mask = mask[t : min(T, t + H + 1)]
+                if t + H + 1 >= T:
+                    temp_mask = np.concat((temp_mask, np.full(H + 1 - (T - t), False)))
+                if mask_any_prev_h:
                     temp_mask = temp_mask.cumsum() > 0
                 to = to | temp_mask
             Y.append(ty)
             omit_obs.append(to)
-        self._Ys = np.stack(Y, axis=0)
-        exog = self.exog.reshape((T, 1, k))
-        exog = np.repeat(exog, self.H + 1, axis=1)
-        shock = np.einsum("hv,t->thv", B, self.shock)
+        Ys = np.stack(Y, axis=0)
+        exog = exog.reshape((T, 1, k))
+        exog = np.repeat(exog, H + 1, axis=1)
+        shock = np.einsum("hv,t->thv", B, shock)
         X_s = np.concat((shock, exog), axis=2)
         # Set the X matrix to zero for all values out of the bound
-        omit_obs = np.stack(omit_obs, axis=0).reshape((T, self.H + 1, 1)).astype(bool)
+        omit_obs = np.stack(omit_obs, axis=0).reshape((T, H + 1, 1)).astype(bool)
         # Apply the mask to X values
-        if self.mask is not None and self.mask_type in ("x", "both"):
-            temp_mask = np.repeat(self.mask.reshape((T, 1, 1)), self.H + 1, axis=1)
+        if mask is not None and mask_type in ("x", "both"):
+            temp_mask = np.repeat(mask.reshape((T, 1, 1)), H + 1, axis=1)
             omit_obs = omit_obs | temp_mask
-        self._omit = omit_obs
-        self._Xs = np.where(self._omit, 0.0, X_s)
 
-        Y = self._Ys.flatten()
-        X = self._Xs.reshape(T * (self.H + 1), X_s.shape[2])
+        Y = Ys.flatten()
+        X = X_s.reshape(T * (H + 1), X_s.shape[2])
         Y = Y[~omit_obs.flatten()]
         X = X[~omit_obs.flatten(), :]
 
         # Build the penalty matrix
-        # For now only identity penalty is implemented
         P = np.zeros((X.shape[1], X.shape[1]))
-        D = np.eye(self.H + 1)
+        D = np.eye(H + 1)
         for i in range(2):
             D = np.diff(D, axis=0)
-        P[: (self.H + 1), : (self.H + 1)] = D.T @ D
+        P[: (H + 1), : (H + 1)] = D.T @ D
 
         if lam is None:
             lam, tune_trace = SmoothLocalProjection._tune_lambda(
@@ -174,7 +181,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
                 Y,
                 P,
                 Y.shape[0],
-                self.H + 1,
+                H + 1,
                 lam_grid_lower,
                 lam_grid_upper,
                 lam_grid_size,
@@ -185,19 +192,11 @@ class SmoothLocalProjection(AbstractLocalProjection):
         XtX_lam = X.T @ X + lam * P
         XtX_lam_inv = invert(XtX_lam)
         theta_hat = XtX_lam_inv @ (X.T @ Y)
-        self._us = self._Ys - np.einsum("thk,k->th", self._Xs, theta_hat)
+        u = Ys - np.einsum("thk,k->th", X_s, theta_hat)
 
-        return SmoothLocalProjectionResult(
-            self,
-            knots,
-            P,
-            lam,
-            theta_hat,
-            tune_trace,
-        )
+        return X_s, Ys, P, omit_obs, u, theta_hat, lam, tune_trace
 
     @staticmethod
-    @profile
     def _tune_lambda(
         X,
         y,
@@ -278,7 +277,8 @@ class SmoothLocalProjection(AbstractLocalProjection):
         shock,
         exog,
         input_mask,
-        mask_type,
+        mask_type: str,
+        mask_any_prev_h: bool,
         H: int,
         lam: float,
         lam_grid_lower: float,
@@ -351,25 +351,24 @@ class SmoothLocalProjection(AbstractLocalProjection):
         theta_hat = XpX_lam_inv @ X_flat.T @ Y_flat
         u = Y - jnp.einsum("thk,k->th", X, theta_hat)
 
-        return X, Y, P, mask[..., jnp.newaxis], u, theta_hat, lam, tune_trace
+        return X, Y, P, ~mask[..., jnp.newaxis], u, theta_hat, lam, tune_trace
 
 
+@dataclass
 class SmoothLocalProjectionResult:
     model: SmoothLocalProjection
     knots: np.ndarray
     P: np.ndarray
 
     lam: float
-    theta_hat: np.ndarray
+    coef: np.ndarray
     tune_trace: np.ndarray | None
 
-    def __init__(self, model, knots, P, lam, theta_hat, tune_trace):
-        self.model = model
-        self.knots = knots
-        self.P = P
-        self.lam = lam
-        self.theta_hat = theta_hat
-        self.tune_trace = tune_trace
+    _Xs: np.ndarray | None
+    _Ys: np.ndarray | None
+    _omit: np.ndarray | None
+    _us: np.ndarray | None
+    _engine: str | None
 
     @property
     def H(self):
@@ -382,17 +381,15 @@ class SmoothLocalProjectionResult:
 
     @cached_property
     def irf(self):
-        coef = self.B @ self.theta_hat[: (self.H + 1)].reshape((-1, 1))
+        coef = self.B @ self.coef[: (self.H + 1)].reshape((-1, 1))
         return coef.flatten()
 
     @cached_property
     def vcov_nw(self):
         if self.model._engine == "jax":
-            return self._vcov_nw_jax(self.model._Xs, self.model._us, self.lam, self.P)
+            return self._vcov_nw_jax(self._Xs, self._us, self.lam, self.P)
         else:
-            return self._vcov_nw_inner(
-                self.model._Xs, self.model._us, self.lam, self.P, False
-            )
+            return self._vcov_nw_inner(self._Xs, self._us, self.lam, self.P, False)
 
     @staticmethod
     @jax.jit

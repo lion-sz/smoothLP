@@ -1,4 +1,5 @@
 from functools import partial
+from dataclasses import dataclass
 
 import numpy as np
 from statsmodels import api as sm
@@ -9,6 +10,7 @@ from jax import lax, numpy as jnp
 from smoothlp.models import AbstractLocalProjection, AbstractLocalProjectionResult
 
 
+@dataclass(init=False)
 class LocalProjection(AbstractLocalProjection):
     """Local Projection
 
@@ -269,5 +271,6 @@ class LocalProjection(AbstractLocalProjection):
         return coef, vcov
 
 
+@dataclass
 class LocalProjectionResult(AbstractLocalProjectionResult):
     pass
