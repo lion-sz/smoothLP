@@ -11,9 +11,10 @@ from simulator.components import SimpleAbstractComponent, component_map
 class SinIRF(SimpleAbstractComponent):
     @staticmethod
     def generate(params: "SinIRF", key: Array, h: int):
-        irf = jnp.sin(jnp.arange(h + 1) * jnp.pi / (h + 1)) * (
-            jrng.uniform(key, (1,)) * 2 - 1
-        )
+        k1, k2 = jrng.split(key)
+        magnitude = jrng.uniform(k1, (1,)) * 2 - 1
+        shift = jrng.uniform(k2, (1,)) * h + 1
+        irf = jnp.sin((shift + jnp.arange(h + 1)) * jnp.pi / (h + 1)) * magnitude
         return irf
 
 

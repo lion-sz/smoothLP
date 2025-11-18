@@ -2,12 +2,34 @@ import numpy as np
 
 
 def bspline(p, knots, x):
+    """B-Splines defined through the interior knots on unit interval.
+
+    This function returns k B-Splines, where k is the size of the knots array.
+    Note, that the knots must be equally spaced.
+
+    The return matrix has dimension i x k, where i is the size of x
+    and k the number of splines.
+    """
+    np.testing.assert_allclose(np.diff(knots), 1.0)
     k = knots.shape[0]
+    # Add boundaries
+    if p > 0:
+        knots = np.concat(
+            (
+                np.arange(knots[0] - p, knots[0]),
+                knots,
+                np.arange(knots[-1] + 1, knots[-1] + p + 2),
+            )
+        )
+
+    # Reshape
+    knots = knots.reshape(-1, 1)
+    x = x.reshape(1, -1)
+
     # Compute the 0th order bspline
     temp = np.roll(knots, -1)
-    temp[-1] = np.inf  # If I enforce that x is within the bounds, this is unneeded.
-    b = np.where(x > knots, (x <= temp).astype(float), 0.0)
-    # Note, that the last element is not needed...
+    temp[-1] = knots[-1] + 1.0
+    b = ((x >= knots) & (x < temp)).astype(float)
 
     # Compute the higher order bsplines
     for i in range(1, p + 1):
@@ -15,11 +37,11 @@ def bspline(p, knots, x):
         x2 = (
             (np.roll(knots, -(i + 1)) - x)
             / (np.roll(knots, -(i + 1)) - np.roll(knots, -1))
-            * np.roll(b, -1)
+            * np.roll(b, -1, axis=0)
         )
         b = x1 + x2
 
-    return b[: (k - p - 1)]
+    return b[p : (p + k), :].T
 
 
 def demean(

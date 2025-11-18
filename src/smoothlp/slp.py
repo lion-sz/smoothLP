@@ -39,7 +39,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         exog: np.ndarray | None,
         H: int,
         p: int = 3,
-        n_diff: int = 2,
+        target_poly_order: int = 2,
         fe: tuple[np.ndarray] | np.ndarray | None = None,
         mask: np.ndarray | None = None,
         mask_type: str = "both",
@@ -54,7 +54,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
             else:
                 self.fe = fe
         self.p = p
-        self.n_diff = n_diff
+        self.n_diff = target_poly_order + 1
 
         self.mask_any_prev_h = mask_any_prev_h
 
@@ -74,8 +74,17 @@ class SmoothLocalProjection(AbstractLocalProjection):
     ):
         self._engine = engine
         # First create the splines. Indexed by horizon x basis function
-        knots = np.arange(-2, self.H + 3).astype(np.float64)
-        B = np.array([bspline(self.p, knots, x) for x in range(self.H + 1)])
+        knots = np.arange(-2, self.H - 1).astype(np.float64)
+        B = bspline(self.p + 1, knots, np.arange(self.H + 1))
+        B = B / np.sum(B, axis=1)[:, np.newaxis]
+        # TODO: Potential issue here.
+        #   I believe there is a strange interaction between penalty and the splines
+        #   hidden here. Specifically, If I use too few splines, then the sums
+        #   over all splines are not 1 for each horizon. Then the coefficients scale,
+        #   to account for this. But since the penalty applies to the coefficients,
+        #   if is effectively not scale invariant.
+        #   But when I use more than H+1 splines, I run into singularities.
+        #   Therefore I rescale the splines.
 
         if len(self.fe) > 0:
             res = demean(self.fe, [self.endog, self.shock, self.exog], mask=self.mask)
@@ -95,6 +104,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
             self.mask_type,
             self.mask_any_prev_h,
             self.H,
+            self.n_diff,
             lam,
             lam_grid_lower,
             lam_grid_upper,
@@ -107,7 +117,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
             lam,
             theta_hat,
             tune_trace,
-            _Xs=np.where(omit, 0.0, X),
+            _Xs=X,
             _Ys=Y,
             _omit=omit,
             _us=u,
@@ -124,6 +134,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         mask_type: str,
         mask_any_prev_h: bool,
         H: int,
+        n_diff: int,
         lam: float,
         lam_grid_lower: float,
         lam_grid_upper: float,
@@ -132,6 +143,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         # Build the stacked arrays
         T, k = exog.shape
         omit_obs = []
+        n_splines = B.shape[1]
         Y = []
         for t in range(T):
             ty = endog[t : min(T, t + H + 1)]
@@ -170,18 +182,19 @@ class SmoothLocalProjection(AbstractLocalProjection):
 
         # Build the penalty matrix
         P = np.zeros((X.shape[1], X.shape[1]))
-        D = np.eye(H + 1)
-        for i in range(2):
+        D = np.eye(n_splines)
+        for i in range(n_diff):
             D = np.diff(D, axis=0)
-        P[: (H + 1), : (H + 1)] = D.T @ D
+        P[:n_splines, :n_splines] = D.T @ D
 
+        N = Y.shape[0]
         if lam is None:
             lam, tune_trace = SmoothLocalProjection._tune_lambda(
                 X,
                 Y,
                 P,
-                Y.shape[0],
-                H + 1,
+                N,
+                n_splines,
                 lam_grid_lower,
                 lam_grid_upper,
                 lam_grid_size,
@@ -189,12 +202,13 @@ class SmoothLocalProjection(AbstractLocalProjection):
         else:
             tune_trace = None
         # Compute the coefficients
-        XtX_lam = X.T @ X + lam * P
+        XtX_lam = X.T @ X + N * lam * P
         XtX_lam_inv = invert(XtX_lam)
         theta_hat = XtX_lam_inv @ (X.T @ Y)
         u = Ys - np.einsum("thk,k->th", X_s, theta_hat)
 
-        return X_s, Ys, P, omit_obs, u, theta_hat, lam, tune_trace
+        X_s_masked = np.where(omit_obs, 0.0, X_s)
+        return X_s_masked, Ys, P, omit_obs, u, theta_hat, lam, tune_trace
 
     @staticmethod
     def _tune_lambda(
@@ -245,7 +259,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         ApA = A.T @ A
 
         def eval_f(lam):
-            d = 1 / (1 + lam * s)
+            d = 1 / (1 + n * lam * s)
             bd = b * d
             rss = ypy - 2 * b.T @ bd + bd.T @ ApA @ bd
             dfit = lib.sum(d)
@@ -280,6 +294,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         mask_type: str,
         mask_any_prev_h: bool,
         H: int,
+        n_diff: int,
         lam: float,
         lam_grid_lower: float,
         lam_grid_upper: float,
@@ -318,6 +333,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         # Apply the mask
         X = X * mask[..., jnp.newaxis]
         Y = Y * mask
+        N = jnp.sum(mask)
 
         Y_flat = Y.flatten()
         X_flat = X.reshape((T * (H + 1)), H + 1 + k)
@@ -325,7 +341,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         # Build the penalty matrix
         P = jnp.zeros((H + 1 + k, H + 1 + k))
         D = jnp.eye(H + 1)
-        for i in range(2):
+        for i in range(n_diff):
             D = jnp.diff(D, axis=0)
         P = P.at[: (H + 1), : (H + 1)].set(D.T @ D)
 
@@ -335,7 +351,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
                 X_flat,
                 Y_flat,
                 P,
-                jnp.sum(mask),
+                N,
                 H + 1,
                 lam_grid_lower,
                 lam_grid_upper,
@@ -346,12 +362,13 @@ class SmoothLocalProjection(AbstractLocalProjection):
             tune_trace = None
 
         # Compute the coefficients
-        XpX_lam = X_flat.T @ X_flat + lam * P
+        XpX_lam = X_flat.T @ X_flat + N * lam * P
         XpX_lam_inv = invert_jax(XpX_lam)
         theta_hat = XpX_lam_inv @ X_flat.T @ Y_flat
         u = Y - jnp.einsum("thk,k->th", X, theta_hat)
 
-        return X, Y, P, ~mask[..., jnp.newaxis], u, theta_hat, lam, tune_trace
+        X_masked = jnp.where(mask[..., jnp.newaxis], X, 0.0)
+        return X_masked, Y, P, ~mask[..., jnp.newaxis], u, theta_hat, lam, tune_trace
 
 
 @dataclass
@@ -376,35 +393,37 @@ class SmoothLocalProjectionResult:
 
     @cached_property
     def B(self):
-        b = np.array([bspline(self.model.p, self.knots, x) for x in range(self.H + 1)])
+        b = bspline(self.model.p + 1, self.knots, np.arange(self.H + 1))
+        b = b / np.sum(b, axis=1)[:, np.newaxis]
         return b
 
     @cached_property
     def irf(self):
-        coef = self.B @ self.coef[: (self.H + 1)].reshape((-1, 1))
+        coef = self.B @ self.coef[: (self.B.shape[1])].reshape((-1, 1))
         return coef.flatten()
 
     @cached_property
     def vcov_nw(self):
+        N = np.sum(~self._omit)
         if self.model._engine == "jax":
-            return self._vcov_nw_jax(self._Xs, self._us, self.lam, self.P)
+            return self._vcov_nw_jax(self._Xs, self._us, N, self.lam, self.P)
         else:
-            return self._vcov_nw_inner(self._Xs, self._us, self.lam, self.P, False)
+            return self._vcov_nw_inner(self._Xs, self._us, N, self.lam, self.P, False)
 
     @staticmethod
     @jax.jit
-    def _vcov_nw_jax(Xs, us, lam, P):
-        return SmoothLocalProjectionResult._vcov_nw_inner(Xs, us, lam, P, True)
+    def _vcov_nw_jax(Xs, us, N, lam, P):
+        return SmoothLocalProjectionResult._vcov_nw_inner(Xs, us, N, lam, P, True)
 
     @staticmethod
-    def _vcov_nw_inner(X, u, lam, P, use_jax=False):
+    def _vcov_nw_inner(X, u, N, lam, P, use_jax=False):
         np_lib = jnp if use_jax else np
 
         T, lags = u.shape
         k = X.shape[2]
 
         xpx1 = np_lib.sum(np_lib.transpose(X, (0, 2, 1)) @ X, axis=0)
-        outer = xpx1 + 0.1 * lam * P
+        outer = xpx1 + 0.1 * N * lam * P
         if use_jax:
             outer = invert_jax(outer)
         else:
@@ -446,9 +465,8 @@ class SmoothLocalProjectionResult:
 
     @cached_property
     def se(self):
-        vcov = (
-            self.B @ self.vcov_nw[: (self.H + 1), : (self.H + 1)] @ self.B.transpose()
-        )
+        n_splines = self.B.shape[1]
+        vcov = self.B @ self.vcov_nw[:n_splines, :n_splines] @ self.B.transpose()
         if isinstance(vcov, Array):
             se = jnp.sqrt(jnp.diag(vcov))
         else:

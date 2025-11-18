@@ -40,10 +40,10 @@ def test_slp_no_mask():
     res_np = slp.SmoothLocalProjection(Y, shock, X, H=20).fit(10.0, engine="np")
     res_jax = slp.SmoothLocalProjection(Y, shock, X, H=20).fit(10.0, engine="jax")
     npt.assert_allclose(res_jax.irf, res_np.irf, rtol=RTOL)
-    npt.assert_allclose(res_jax.coef, res_np.coef, rtol=10 * RTOL)
-    npt.assert_allclose(res_jax.vcov_nw, res_np.vcov_nw, rtol=10 * RTOL)
+    npt.assert_allclose(res_jax.coef, res_np.coef, rtol=RTOL)
+    npt.assert_allclose(res_jax.vcov_nw, res_np.vcov_nw, rtol=RTOL)
 
     # Now tuning the lambda
     res_np = slp.SmoothLocalProjection(Y, shock, X, H=20).fit(None, engine="np")
     res_jax = slp.SmoothLocalProjection(Y, shock, X, H=20).fit(None, engine="jax")
-    npt.assert_allclose(res_jax.lam, res_np.lam, rtol=1e-2)
+    npt.assert_allclose(res_jax.lam, res_np.lam, rtol=1e-3)
