@@ -248,10 +248,11 @@ class SmoothLocalProjection(AbstractLocalProjection):
 
         # Set up the orthogonalization
         XpX = X.T @ X
+        # print("Cond: ", np.linalg.cond(XpX), "Cond 2: ", np.linalg.cond(XpX + 1e-9 * P))
         R = sla_lib.cholesky(XpX, lower=False)
         Rinv = sla_lib.solve_triangular(R, lib.eye(k_shock))
         RTinv_P_Rinv = Rinv.T @ P @ Rinv
-        s, U = lib.linalg.eigh(RTinv_P_Rinv + 1e-9 * P)
+        s, U = lib.linalg.eigh(RTinv_P_Rinv)
         A = X @ Rinv @ U
         b = A.T @ y
 
@@ -264,7 +265,8 @@ class SmoothLocalProjection(AbstractLocalProjection):
             rss = ypy - 2 * b.T @ bd + bd.T @ ApA @ bd
             dfit = lib.sum(d)
             gcv = rss / (1 - dfit / n) ** 2
-            return lib.array([rss, gcv, dfit])
+            aic = lib.log(rss) + 2 * dfit / n
+            return lib.array([rss, gcv, aic, dfit])
 
         # Build the grid and map the step function over it
         lam_grid = lib.exp(lib.linspace(lam_grid_lower, lam_grid_upper, lam_grid_size))
