@@ -25,6 +25,8 @@ def invert_jax(X):
 
 @dataclass
 class SmoothLocalProjection(AbstractLocalProjection):
+    """Run a smoothed local projection"""
+
     fe: tuple[np.ndarray] | np.ndarray | None
 
     p: int
@@ -224,7 +226,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
     ):
         """Tune lambda using Demmler-Reinsch Orthogonalization
 
-        This proceedure was adopted from the LocalProjections Julia package.
+        This procedure was adopted from the LocalProjections Julia package.
         See Rupper (2003), appendix B.1.1 for a reference.
         """
         if use_jax:
@@ -234,7 +236,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
             lib = np
             sla_lib = sla
 
-        # First check if I should parital out some regressors
+        # Partial out non-smoothed regressors.
         if k_shock < X.shape[1]:
             exog = X[:, k_shock:]
             X = X[:, :k_shock]
@@ -247,8 +249,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
             P = P[:k_shock, :k_shock]
 
         # Set up the orthogonalization
-        XpX = X.T @ X
-        # print("Cond: ", np.linalg.cond(XpX), "Cond 2: ", np.linalg.cond(XpX + 1e-9 * P))
+        XpX = X.T @ X + 1e-9 * P
         R = sla_lib.cholesky(XpX, lower=False)
         Rinv = sla_lib.solve_triangular(R, lib.eye(k_shock))
         RTinv_P_Rinv = Rinv.T @ P @ Rinv
