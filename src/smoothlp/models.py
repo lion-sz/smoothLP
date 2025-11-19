@@ -5,6 +5,8 @@ from jax import Array, numpy as jnp
 
 @dataclass(init=True)
 class AbstractLocalProjection:
+    """Baseclass for all Local Projection Methods."""
+
     endog: np.ndarray
     shock: np.ndarray
     exog: np.ndarray | None
@@ -23,6 +25,17 @@ class AbstractLocalProjection:
         mask: np.ndarray | None = None,
         mask_type: str = "both",
     ):
+        """These are the shared kwargs.
+
+        Args:
+            endog (np.ndarray, 1d): The endogenous variable.
+            shock (np.ndarray, 1d): The shock variable.
+            exog (np.ndarray, 2d): The exogenous variables.
+            H (int): The local projection horizon.
+            mask (np.ndarray, 1d): The mask variable.
+            mask_type (str): The mask type to use.
+                Must be one of `x`, `y`, or `both` (default).
+        """
         assert endog.ndim == 1, "Outcome must be one dimensional."
         assert shock.ndim == 1, "Shock must be one dimensional."
         assert exog is None or exog.ndim == 2, "Endog must be two dimensional."
@@ -52,6 +65,17 @@ class AbstractLocalProjection:
 
 @dataclass
 class AbstractLocalProjectionResult:
+    """Result container for a local projection.
+
+    Attributes:
+        model (AbstractLocalProjection): The model estimated.
+        irf (np.ndarray): The estimated impulse response.
+        se (np.ndarray): The standard error of the impulse response.
+        coef (np.ndarray): The estimated coefficients.
+        vcov (np.ndarray): The estimated covariance matrix.
+        vcov_type (str): The type of the covariance matrix.
+    """
+
     model: AbstractLocalProjection
 
     coef: np.ndarray

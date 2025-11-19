@@ -6,4 +6,4 @@ references
 scripts
 **/profile_*.txt
 **/profile_output.lprof
-
+doc/build

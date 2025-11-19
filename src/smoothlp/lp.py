@@ -33,6 +33,17 @@ class LocalProjection(AbstractLocalProjection):
     """
 
     def fit(self, vcov="HC3", engine="np") -> "LocalProjectionResult":
+        """Fit the local projection and return a :class:`LocalProjectionResult`
+
+        Args:
+            vcov (str): The variance-covariance estimator.
+                Must be one of `non-robust`, `HC1`, `HC3` (default), or `HAC`.
+            engine (str): The engine to use.
+                Must be one of `np` (default), `sm` and `jax`.
+                Jax can run on a GPU, which can be a lot faster, but also runs only
+                with 32bits, so might lose a lot of precision.
+                Don't use this for main estimations.
+        """
         assert engine in ("np", "sm", "jax"), f"Engine '{engine}' not recognised."
         assert vcov in ("non-robust", "HC1", "HC3", "HAC"), (
             f"vcov '{vcov}' not recognised."

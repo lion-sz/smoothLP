@@ -31,6 +31,8 @@ build-backend = "uv_build"
 dev = [
     "line-profiler>=5.0.0",
     "pytest>=8.4.2",
+    "sphinx>=8.2.3",
+    "sphinx-rtd-theme>=3.0.2",
 ]
 
 [tool.uv.workspace]
