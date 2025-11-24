@@ -1,11 +1,12 @@
-from functools import partial
 from dataclasses import dataclass
+from functools import partial
 
-import numpy as np
-from statsmodels import api as sm
-from scipy import linalg as sla
 import jax
-from jax import lax, numpy as jnp
+import numpy as np
+from jax import lax
+from jax import numpy as jnp
+from scipy import linalg as sla
+from statsmodels import api as sm
 
 from smoothlp.models import AbstractLocalProjection, AbstractLocalProjectionResult
 
@@ -51,11 +52,11 @@ class LocalProjection(AbstractLocalProjection):
 
         if self.exog is not None:
             if engine == "jax":
-                X = jnp.concatenate((self.shock.reshape(-1, 1), self.exog), axis=1)
+                X = jnp.concatenate((self.shock, self.exog), axis=1)
             else:
-                X = np.concatenate((self.shock.reshape(-1, 1), self.exog), axis=1)
+                X = np.concatenate((self.shock, self.exog), axis=1)
         else:
-            X = self.shock.reshape((-1, 1))
+            X = self.shock
 
         if engine == "np":
             engine_func = LocalProjection._estimation_np
@@ -73,7 +74,7 @@ class LocalProjection(AbstractLocalProjection):
             self.mask_type,
         )
 
-        return LocalProjectionResult(self, coef, vcov_vals, vcov)
+        return LocalProjectionResult(self, coef, vcov_vals, vcov, engine)
 
     @staticmethod
     def _estimation_np(

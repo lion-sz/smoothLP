@@ -1,6 +1,7 @@
 from dataclasses import dataclass
+
 import numpy as np
-from jax import Array, numpy as jnp
+from jax import numpy as jnp
 
 
 @dataclass(init=True)
@@ -29,7 +30,8 @@ class AbstractLocalProjection:
 
         Args:
             endog (np.ndarray, 1d): The endogenous variable.
-            shock (np.ndarray, 1d): The shock variable.
+            shock (np.ndarray, 1d or 2d): The shock variable(s).
+                Can be 1D (single shock) or 2D (multiple shocks).
             exog (np.ndarray, 2d): The exogenous variables.
             H (int): The local projection horizon.
             mask (np.ndarray, 1d): The mask variable.
@@ -37,7 +39,7 @@ class AbstractLocalProjection:
                 Must be one of `x`, `y`, or `both` (default).
         """
         assert endog.ndim == 1, "Outcome must be one dimensional."
-        assert shock.ndim == 1, "Shock must be one dimensional."
+        assert shock.ndim in (1, 2), "Shock must be one or two dimensional."
         assert exog is None or exog.ndim == 2, "Endog must be two dimensional."
         assert mask is None or mask.ndim == 1, "Mask must be one dimensional."
         T = endog.shape[0]
@@ -51,7 +53,8 @@ class AbstractLocalProjection:
         assert mask_type in ("x", "y", "both")
 
         self.endog = endog
-        self.shock = shock
+        # Cast shock to 2D internally
+        self.shock = shock.reshape(-1, 1) if shock.ndim == 1 else shock
         self.exog = exog
 
         self.H = H
@@ -59,7 +62,7 @@ class AbstractLocalProjection:
         self.mask = mask
         self.mask_type = mask_type
 
-    def fit(self, vcov_type: str | None) -> "AbstractLocalProjectionResult":
+    def fit(self, vcov: str | None) -> "AbstractLocalProjectionResult":
         raise NotImplementedError()
 
 
@@ -81,6 +84,7 @@ class AbstractLocalProjectionResult:
     coef: np.ndarray
     vcov: np.ndarray | None
     vcov_type: str | None
+    _engine: str = "np"
 
     def __init__(
         self,
@@ -96,11 +100,22 @@ class AbstractLocalProjectionResult:
 
     @property
     def irf(self):
-        return self.coef[:, 0]
+        # Return IRFs for all shocks (first n_shocks columns)
+        n_shocks = self.model.shock.shape[1]
+        if n_shocks == 1:
+            return self.coef[:, 0]
+        else:
+            return self.coef[:, :n_shocks]
 
     @property
     def se(self):
-        if isinstance(self.vcov, Array):
-            return jnp.sqrt(self.vcov[:, 0, 0])
+        # Return standard errors for all shocks
+        assert self.vcov is not None, "vcov is not available"
+        n_shocks = self.model.shock.shape[1]
+        lib = jnp if self._engine == "jax" else np
+        if n_shocks == 1:
+            return lib.sqrt(self.vcov[:, 0, 0])
         else:
-            return np.sqrt(self.vcov[:, 0, 0])
+            return lib.sqrt(
+                lib.stack([self.vcov[:, i, i] for i in range(n_shocks)], axis=1)
+            )

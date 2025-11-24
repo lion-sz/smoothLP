@@ -1,11 +1,13 @@
 import warnings
-from functools import cached_property
 from dataclasses import dataclass
+from functools import cached_property
 
-import numpy as np
-from scipy import linalg as sla
 import jax
-from jax import Array, lax, numpy as jnp, scipy as jsp
+import numpy as np
+from jax import lax
+from jax import numpy as jnp
+from jax import scipy as jsp
+from scipy import linalg as sla
 
 from smoothlp.models import AbstractLocalProjection
 from smoothlp.utils import bspline, demean
@@ -27,7 +29,7 @@ def invert_jax(X):
 class SmoothLocalProjection(AbstractLocalProjection):
     """Run a smoothed local projection"""
 
-    fe: tuple[np.ndarray] | np.ndarray | None
+    fe: tuple[np.ndarray] | tuple
 
     p: int
     n_diff: int
@@ -49,9 +51,9 @@ class SmoothLocalProjection(AbstractLocalProjection):
     ):
         super().__init__(endog, shock, exog, H, mask, mask_type)
         if fe is None:
-            self.fe = ()
+            self.fe = tuple()
         else:
-            if fe and not isinstance(fe, (list, tuple)):
+            if not isinstance(fe, (list, tuple)):
                 self.fe = (fe,)
             else:
                 self.fe = fe
@@ -64,7 +66,6 @@ class SmoothLocalProjection(AbstractLocalProjection):
         self._Ys = None
         self._omit = None
         self._us = None
-        self._engine = None
 
     def fit(
         self,
@@ -74,7 +75,6 @@ class SmoothLocalProjection(AbstractLocalProjection):
         lam_grid_size: int = 10_000,
         engine: str = "np",
     ):
-        self._engine = engine
         # First create the splines. Indexed by horizon x basis function
         knots = np.arange(-2, self.H - 1).astype(np.float64)
         B = bspline(self.p + 1, knots, np.arange(self.H + 1))
@@ -137,7 +137,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         mask_any_prev_h: bool,
         H: int,
         n_diff: int,
-        lam: float,
+        lam: float | None,
         lam_grid_lower: float,
         lam_grid_upper: float,
         lam_grid_size: int,
@@ -146,6 +146,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         T, k = exog.shape
         omit_obs = []
         n_splines = B.shape[1]
+        n_shocks = shock.shape[1]
         Y = []
         for t in range(T):
             ty = endog[t : min(T, t + H + 1)]
@@ -168,8 +169,11 @@ class SmoothLocalProjection(AbstractLocalProjection):
         Ys = np.stack(Y, axis=0)
         exog = exog.reshape((T, 1, k))
         exog = np.repeat(exog, H + 1, axis=1)
-        shock = np.einsum("hv,t->thv", B, shock)
-        X_s = np.concat((shock, exog), axis=2)
+        shocks = tuple(
+            np.einsum("hv,t->thv", B, shock[:, i].flatten())
+            for i in range(shock.shape[1])
+        )
+        X_s = np.concat(shocks + (exog,), axis=2)
         # Set the X matrix to zero for all values out of the bound
         omit_obs = np.stack(omit_obs, axis=0).reshape((T, H + 1, 1)).astype(bool)
         # Apply the mask to X values
@@ -187,8 +191,12 @@ class SmoothLocalProjection(AbstractLocalProjection):
         D = np.eye(n_splines)
         for i in range(n_diff):
             D = np.diff(D, axis=0)
-        P[:n_splines, :n_splines] = D.T @ D
-
+        temp = D.T @ D
+        for i in range(n_shocks):
+            P[
+                (i * n_splines) : (i + 1) * n_splines,
+                (i * n_splines) : (i + 1) * n_splines,
+            ] = temp
         N = Y.shape[0]
         if lam is None:
             lam, tune_trace = SmoothLocalProjection._tune_lambda(
@@ -196,7 +204,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
                 Y,
                 P,
                 N,
-                n_splines,
+                n_splines * n_shocks,
                 lam_grid_lower,
                 lam_grid_upper,
                 lam_grid_size,
@@ -298,7 +306,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         mask_any_prev_h: bool,
         H: int,
         n_diff: int,
-        lam: float,
+        lam: float | None,
         lam_grid_lower: float,
         lam_grid_upper: float,
         lam_grid_size: int,
@@ -388,7 +396,7 @@ class SmoothLocalProjectionResult:
     _Ys: np.ndarray | None
     _omit: np.ndarray | None
     _us: np.ndarray | None
-    _engine: str | None
+    _engine: str = "np"
 
     @property
     def H(self):
@@ -402,13 +410,24 @@ class SmoothLocalProjectionResult:
 
     @cached_property
     def irf(self):
-        coef = self.B @ self.coef[: (self.B.shape[1])].reshape((-1, 1))
-        return coef.flatten()
+        B = self.B
+        n_splines = B.shape[1]
+        n_shocks = self.model.shock.shape[1]
+        irfs = [
+            (
+                self.B @ self.coef[i * n_splines : (i + 1) * n_splines].reshape((-1, 1))
+            ).flatten()
+            for i in range(n_shocks)
+        ]
+        irf = np.stack(irfs, axis=1)
+        if n_shocks == 1:
+            irf = irf.squeeze()
+        return irf
 
     @cached_property
     def vcov_nw(self):
         N = np.sum(~self._omit)
-        if self.model._engine == "jax":
+        if self._engine == "jax":
             return self._vcov_nw_jax(self._Xs, self._us, N, self.lam, self.P)
         else:
             return self._vcov_nw_inner(self._Xs, self._us, N, self.lam, self.P, False)
@@ -468,10 +487,19 @@ class SmoothLocalProjectionResult:
 
     @cached_property
     def se(self):
-        n_splines = self.B.shape[1]
-        vcov = self.B @ self.vcov_nw[:n_splines, :n_splines] @ self.B.transpose()
-        if isinstance(vcov, Array):
-            se = jnp.sqrt(jnp.diag(vcov))
-        else:
-            se = np.sqrt(np.diag(vcov))
+        B = self.B
+        n_splines = B.shape[1]
+        n_shocks = self.model.shock.shape[1]
+        lib = jnp if self._engine == "jax" else np
+        ses = []
+        for i in range(n_shocks):
+            shock_slice = slice(i * n_splines, (i + 1) * n_splines)
+            ses.append(
+                lib.sqrt(
+                    lib.diag(B @ self.vcov_nw[shock_slice, shock_slice] @ B.transpose())
+                )
+            )
+        se = np.stack(ses, axis=1)
+        if n_shocks == 1:
+            se = se.squeeze(axis=1)
         return se

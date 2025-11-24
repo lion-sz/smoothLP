@@ -46,7 +46,7 @@ def bspline(p, knots, x):
 
 def demean(
     fe: list[np.ndarray],
-    data=list[np.ndarray],
+    data: list[np.ndarray],
     maxiter: int = 10,
     norm: float = 1e-6,
     mask: np.ndarray = None,
