@@ -16,6 +16,7 @@ class AbstractLocalProjection:
 
     mask: np.ndarray | None
     mask_type: str
+    diff: np.ndarray | None
 
     def __init__(
         self,
@@ -25,6 +26,7 @@ class AbstractLocalProjection:
         H: int,
         mask: np.ndarray | None = None,
         mask_type: str = "both",
+        diff: np.ndarray | None = None,
     ):
         """These are the shared kwargs.
 
@@ -37,15 +39,21 @@ class AbstractLocalProjection:
             mask (np.ndarray, 1d): The mask variable.
             mask_type (str): The mask type to use.
                 Must be one of `x`, `y`, or `both` (default).
+            diff (np.ndarray, 1d): Optional differencing term aligned with X_t.
+                If provided, horizon h uses `endog[t+h] - diff[t]` as outcome.
         """
         assert endog.ndim == 1, "Outcome must be one dimensional."
         assert shock.ndim in (1, 2), "Shock must be one or two dimensional."
         assert exog is None or exog.ndim == 2, "Endog must be two dimensional."
+        assert diff is None or diff.ndim == 1, "Diff must be one dimensional."
         assert mask is None or mask.ndim == 1, "Mask must be one dimensional."
         T = endog.shape[0]
         assert shock.shape[0] == T, "Shock and endog must have same length."
         assert exog is None or exog.shape[0] == T, (
             "Exog and endog must have same length."
+        )
+        assert diff is None or diff.shape[0] == T, (
+            "Diff and endog must have same length."
         )
         assert mask is None or mask.shape[0] == T, (
             "Mask and endog must have same length."
@@ -61,6 +69,7 @@ class AbstractLocalProjection:
 
         self.mask = mask
         self.mask_type = mask_type
+        self.diff = diff
 
     def fit(self, vcov: str | None) -> "AbstractLocalProjectionResult":
         raise NotImplementedError()

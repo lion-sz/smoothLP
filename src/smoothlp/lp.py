@@ -70,6 +70,7 @@ class LocalProjection(AbstractLocalProjection):
             X,
             self.H,
             vcov,
+            self.diff,
             self.mask,
             self.mask_type,
         )
@@ -82,6 +83,7 @@ class LocalProjection(AbstractLocalProjection):
         X: np.ndarray,
         H: int,
         vcov_type: str,
+        diff: np.ndarray | None,
         mask: np.ndarray | None,
         mask_type: str = "both",
     ):
@@ -91,7 +93,10 @@ class LocalProjection(AbstractLocalProjection):
 
         for h in range(H + 1):
             tx = X[: (T - h), :]
-            ty = Y[h:]
+            if diff is None:
+                ty = Y[h:]
+            else:
+                ty = Y[h:] - diff[: (T - h)]
 
             if mask is not None:
                 if mask_type == "x":
@@ -163,10 +168,12 @@ class LocalProjection(AbstractLocalProjection):
         X: np.ndarray,
         H: int,
         vcov_type: str,
+        diff: np.ndarray | None,
         mask: np.ndarray | None,
         mask_type: str = "both",
     ):
         assert mask is None, "Mask not yet fully supported"
+        assert diff is None, "Diff nto yet fully supported"
         T, k = X.shape
         XpX = X.T @ X
         XpX_end = jnp.einsum("ti,tj->tij", X[(-H - 1) :, :], X[(-H - 1) :, :])
@@ -245,6 +252,7 @@ class LocalProjection(AbstractLocalProjection):
         X: np.ndarray,
         H: int,
         vcov_type: str,
+        diff: np.ndarray | None,
         mask: np.ndarray | None,
         mask_type: str = "both",
     ):
@@ -255,7 +263,10 @@ class LocalProjection(AbstractLocalProjection):
 
         for h in range(H + 1):
             tx = X[: (T - h), :]
-            ty = Y[h:]
+            if diff is None:
+                ty = Y[h:]
+            else:
+                ty = Y[h:] - diff[: (T - h)]
 
             if mask is not None:
                 if mask_type == "x":
