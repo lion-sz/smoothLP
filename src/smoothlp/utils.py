@@ -1,4 +1,6 @@
 import numpy as np
+from scipy import linalg as sla
+from jax import numpy as jnp, scipy as jsp
 
 
 def bspline(p, knots, x):
@@ -107,3 +109,25 @@ def demean(
 
     print(f"Exited demeaning after {iter} iterations with norm {iter_norm}.")
     return data
+
+
+def np_vmap(f, in_axes=0, out_axes=0):
+    def mapped(x):
+        temp = np.moveaxis(x, in_axes, 0)
+        return np.stack(
+            [f(temp[_i, ...]) for _i in range(temp.shape[0])], axis=out_axes
+        )
+
+    return mapped
+
+
+def invert(X):
+    U = sla.cholesky(X)
+    U_inv = sla.solve_triangular(U, np.eye(X.shape[0]))
+    return U_inv @ U_inv.T
+
+
+def invert_jax(X):
+    U = jsp.linalg.cholesky(X)
+    U_inv = jsp.linalg.solve_triangular(U, jnp.eye(X.shape[0]))
+    return U_inv @ U_inv.T

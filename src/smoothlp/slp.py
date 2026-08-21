@@ -1,28 +1,45 @@
-import warnings
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, partial
+from datetime import datetime
 
 import jax
 import numpy as np
-from jax import lax
-from jax import numpy as jnp
-from jax import scipy as jsp
-from scipy import linalg as sla
+from jax import lax, Array
+from jax import numpy as jnp, scipy as jsp
+from jaxtyping import Float
 
 from smoothlp.models import AbstractLocalProjection
-from smoothlp.utils import bspline, demean
+from smoothlp.utils import bspline, demean, invert_jax
 
 
-def invert(X):
-    U = sla.cholesky(X)
-    U_inv = sla.solve_triangular(U, np.eye(X.shape[0]))
-    return U_inv @ U_inv.T
+def build_stacked(
+    endog: Float[Array, "T"],
+    mask: Float[Array, "T"],
+    H: int,
+    mask_type: str = "both",
+) -> tuple[Float[Array, "T H+1"], Float[Array, "T H+1"]]:
+    def fy(ty, _):
+        typ = jnp.roll(ty, -1)
+        return typ, ty
 
+    Ys = lax.scan(fy, endog, length=H + 1)[1]
+    Ys = Ys.swapaxes(0, 1)
 
-def invert_jax(X):
-    U = jsp.linalg.cholesky(X)
-    U_inv = jsp.linalg.solve_triangular(U, jnp.eye(X.shape[0]))
-    return U_inv @ U_inv.T
+    def fm(tm, _):
+        tmp = jnp.roll(tm, -1)
+        tmp = tmp.at[-1].set(0)
+        return tmp, tm
+
+    if mask_type in ("both", "y"):
+        start = mask
+    else:
+        start = jnp.ones_like(mask)
+    mask_s = lax.scan(fm, start, length=H + 1)[1]
+    mask_s = mask_s.swapaxes(0, 1)
+    if mask_type in ("both", "x"):
+        mask_s = mask_s * mask[:, np.newaxis]
+
+    return Ys, mask_s
 
 
 @dataclass
@@ -67,18 +84,16 @@ class SmoothLocalProjection(AbstractLocalProjection):
         self._omit = None
         self._us = None
 
-    def fit(
-        self,
-        lam: float | None,
-        lam_grid_lower: float = -5.0,
-        lam_grid_upper: float = 5.0,
-        lam_grid_size: int = 10_000,
-        engine: str = "np",
-    ):
-        # First create the splines. Indexed by horizon x basis function
-        knots = np.arange(-2, self.H - 1).astype(np.float64)
-        B = bspline(self.p + 1, knots, np.arange(self.H + 1))
+    @property
+    def knots(self):
+        return np.arange(-2, self.H - 1).astype(np.float64)
+
+    @property
+    def B(self):
+        B = bspline(self.p + 1, self.knots, np.arange(self.H + 1))
+        # B = B[:, :-2]
         B = B / np.sum(B, axis=1)[:, np.newaxis]
+        return B
         # TODO: Potential issue here.
         #   I believe there is a strange interaction between penalty and the splines
         #   hidden here. Specifically, If I use too few splines, then the sums
@@ -87,47 +102,66 @@ class SmoothLocalProjection(AbstractLocalProjection):
         #   if is effectively not scale invariant.
         #   But when I use more than H+1 splines, I run into singularities.
         #   Therefore I rescale the splines.
+        #   Note: replaced normalization with boundary trimming — drop p-1 columns
+        #   from each end so all retained splines have complete support on [0, H],
+        #   avoiding the scale interaction with the penalty (matches Julia).
+
+        # New Version:
+        # knots = np.arange(-(self.p + 1), self.H + self.p - 1).astype(np.float64)
+        # B = bspline(self.p + 1, knots, np.arange(self.H + 1))
+        # B = B[:, self.p: B.shape[1] - self.p - 2]
+        # print(B.shape)
+
+    def fit(
+        self,
+        lam: float | None,
+        lam_grid_lower: float = -3.0,
+        lam_grid_upper: float = 4.0,
+        lam_grid_size: int = 1_000,
+    ):
+        # First create the splines. Indexed by horizon x basis function
 
         if len(self.fe) > 0:
             res = demean(self.fe, [self.endog, self.shock, self.exog], mask=self.mask)
             self.endog, self.shock, self.exog = res
 
-        if engine == "jax":
-            engine_fn = SmoothLocalProjection._fit_jax
-        else:
-            engine_fn = SmoothLocalProjection._fit_np
+        params = {
+            "mask_type": "both",
+            "mask_any_prev_h": self.mask_any_prev_h,
+            "H": self.H,
+            "n_diff": self.n_diff,
+            "lam": lam,
+            "lam_grid_lower": lam_grid_lower,
+            "lam_grid_upper": lam_grid_upper,
+            "lam_grid_size": lam_grid_size,
+        }
+        engine_fn = jax.jit(partial(SmoothLocalProjection._fit, **params))
 
-        X, Y, P, omit, u, theta_hat, lam, tune_trace = engine_fn(
-            B,
-            self.endog,
-            self.shock,
-            self.exog,
-            self.mask,
-            self.mask_type,
-            self.mask_any_prev_h,
-            self.H,
-            self.n_diff,
-            lam,
-            lam_grid_lower,
-            lam_grid_upper,
-            lam_grid_size,
+        s = datetime.now()
+        res = jax.block_until_ready(
+            engine_fn(self.B, self.endog, self.shock, self.exog, self.mask)
         )
+        X, Y, P, mask, u, theta_hat, vcov_nw, lam, tune_trace = (
+            np.array(r) for r in res
+        )
+        print(f"Runtime of {(datetime.now() - s).total_seconds()}s")
+
         return SmoothLocalProjectionResult(
             self,
-            knots,
+            self.knots,
             P,
             lam,
             theta_hat,
+            vcov_nw,
             tune_trace,
             _Xs=X,
             _Ys=Y,
-            _omit=omit,
+            _mask=mask,
             _us=u,
-            _engine=engine,
         )
 
     @staticmethod
-    def _fit_np(
+    def _fit(
         B,
         endog,
         shock,
@@ -144,64 +178,57 @@ class SmoothLocalProjection(AbstractLocalProjection):
     ):
         # Build the stacked arrays
         T, k = exog.shape
-        omit_obs = []
-        n_splines = B.shape[1]
         n_shocks = shock.shape[1]
-        Y = []
-        for t in range(T):
-            ty = endog[t : min(T, t + H + 1)]
-            if t + H + 1 >= T:
-                to = np.arange(t, t + H + 1) >= T
-                ty = np.concat((ty, np.zeros(H + 1 - (T - t))))
-                assert ty.shape[0] == H + 1
-            else:
-                to = np.full(ty.shape, False)
-            # Apply the mask to y values
-            if mask is not None and mask_type in ("y", "both"):
-                temp_mask = mask[t : min(T, t + H + 1)]
-                if t + H + 1 >= T:
-                    temp_mask = np.concat((temp_mask, np.full(H + 1 - (T - t), False)))
-                if mask_any_prev_h:
-                    temp_mask = temp_mask.cumsum() > 0
-                to = to | temp_mask
-            Y.append(ty)
-            omit_obs.append(to)
-        Ys = np.stack(Y, axis=0)
-        exog = exog.reshape((T, 1, k))
-        exog = np.repeat(exog, H + 1, axis=1)
-        shocks = tuple(
-            np.einsum("hv,t->thv", B, shock[:, i].flatten())
-            for i in range(shock.shape[1])
-        )
-        X_s = np.concat(shocks + (exog,), axis=2)
-        # Set the X matrix to zero for all values out of the bound
-        omit_obs = np.stack(omit_obs, axis=0).reshape((T, H + 1, 1)).astype(bool)
-        # Apply the mask to X values
-        if mask is not None and mask_type in ("x", "both"):
-            temp_mask = np.repeat(mask.reshape((T, 1, 1)), H + 1, axis=1)
-            omit_obs = omit_obs | temp_mask
+        n_splines = B.shape[1]
 
-        Y = Ys.flatten()
-        X = X_s.reshape(T * (H + 1), X_s.shape[2])
-        Y = Y[~omit_obs.flatten()]
-        X = X[~omit_obs.flatten(), :]
+        Xs = exog
+        if mask is None:
+            mask = jnp.ones(T)
+        Ys, mask_s = build_stacked(endog, mask, H, mask_type)
+        N = jnp.sum(mask_s)
+
+        # Partial out the exogenous variables
+        XpX = jnp.einsum("ti,tj,th->ijh", Xs, Xs, mask_s)
+        XpX_inv = jax.vmap(invert_jax, in_axes=-1, out_axes=-1)(XpX)
+
+        Ys_partial = jnp.einsum(
+            "tj,jkh,qk,qh, qh->th", Xs, XpX_inv, Xs, mask_s, Ys, optimize="greedy"
+        )
+        Ys_r = Ys - Ys_partial
+        Ys_r_m = Ys_r * mask_s
+
+        Bs = jnp.einsum("hk,ts->thsk", B, shock)
+        Bs = Bs.reshape(T, H + 1, n_splines * shock.shape[1])
+        Bs_partial = jnp.einsum(
+            "ti, ikh, qk, qh, qhj -> thj",
+            Xs,
+            XpX_inv,
+            Xs,
+            mask_s,
+            Bs,
+            optimize="greedy",
+        )
+        Bs_r_m = Bs - Bs_partial
+        Bs_r_m = Bs_r_m * mask_s[..., jnp.newaxis]
+
+        Y_r_m = Ys_r_m.reshape(T * (H + 1))
+        B_r_m = Bs_r_m.reshape(T * (H + 1), n_splines)
 
         # Build the penalty matrix
-        P = np.zeros((X.shape[1], X.shape[1]))
-        D = np.eye(n_splines)
+        P = jnp.zeros((n_splines * n_shocks, n_splines * n_shocks))
+        D = jnp.eye(n_splines)
         for i in range(n_diff):
-            D = np.diff(D, axis=0)
+            D = jnp.diff(D, axis=0)
         temp = D.T @ D
         for i in range(n_shocks):
-            P[
+            P = P.at[
                 (i * n_splines) : (i + 1) * n_splines,
                 (i * n_splines) : (i + 1) * n_splines,
-            ] = temp
-        N = Y.shape[0]
+            ].set(temp)
         if lam is None:
             lam, tune_trace = SmoothLocalProjection._tune_lambda(
-                X,
-                Y,
+                B_r_m,
+                Y_r_m,
                 P,
                 N,
                 n_splines * n_shocks,
@@ -211,14 +238,34 @@ class SmoothLocalProjection(AbstractLocalProjection):
             )
         else:
             tune_trace = None
-        # Compute the coefficients
-        XtX_lam = X.T @ X + N * lam * P
-        XtX_lam_inv = invert(XtX_lam)
-        theta_hat = XtX_lam_inv @ (X.T @ Y)
-        u = Ys - np.einsum("thk,k->th", X_s, theta_hat)
 
-        X_s_masked = np.where(omit_obs, 0.0, X_s)
-        return X_s_masked, Ys, P, omit_obs, u, theta_hat, lam, tune_trace
+        XtX_lam = B_r_m.T @ B_r_m + lam * P
+        XtX_lam_inv = jnp.linalg.pinv(XtX_lam)
+        theta_hat = XtX_lam_inv @ (B_r_m.T @ Y_r_m)
+        u = Ys_r - jnp.einsum("thk,k->th", Bs_r_m, theta_hat)
+        u = u
+
+        # Compute the covariance matrix for the splines.
+        Xu = jnp.einsum("thk,th->tk", Bs_r_m, u)
+        Xu_past = Xu
+        d_vcov = Bs_r_m.shape[2]
+
+        def comp_gamma(carry, l):
+            Xu_past, lrv = carry
+            gamma = Xu.T @ Xu_past
+            Xu_past = jnp.roll(Xu_past.at[0, ...].set(0.0), -1, axis=0)
+            lrv = lrv + (1 - l / (H + 1)) * (gamma + gamma.T * (l > 0))
+            return (Xu_past, lrv), gamma
+
+        (_, lrv), gammas = lax.scan(
+            comp_gamma, (Xu_past, jnp.zeros((d_vcov, d_vcov))), np.arange(H + 1)
+        )
+
+        XpX = jnp.einsum("thi,thj->ij", Bs_r_m, Bs_r_m) + 0.1 * lam * P
+        XpX_inv = jnp.linalg.pinv(XpX)
+        vcov_nw = XpX_inv @ lrv @ XpX_inv
+
+        return Bs_r_m, Ys, P, mask_s, u, theta_hat, vcov_nw, lam, tune_trace
 
     @staticmethod
     def _tune_lambda(
@@ -230,156 +277,44 @@ class SmoothLocalProjection(AbstractLocalProjection):
         lam_grid_lower: float,
         lam_grid_upper: float,
         lam_grid_size: int,
-        use_jax: bool = False,
     ):
         """Tune lambda using Demmler-Reinsch Orthogonalization
 
         This procedure was adopted from the LocalProjections Julia package.
         See Rupper (2003), appendix B.1.1 for a reference.
         """
-        if use_jax:
-            lib = jnp
-            sla_lib = jsp.linalg
-        else:
-            lib = np
-            sla_lib = sla
-
-        # Partial out non-smoothed regressors.
-        if k_shock < X.shape[1]:
-            exog = X[:, k_shock:]
-            X = X[:, :k_shock]
-
-            EpE = exog.T @ exog
-            EpE_inv = invert_jax(EpE) if use_jax else invert(EpE)
-            X = X - (exog @ EpE_inv) @ (exog.T @ X)
-            y = y - (exog @ EpE_inv) @ (exog.T @ y)
-
-            P = P[:k_shock, :k_shock]
 
         # Set up the orthogonalization
         XpX = X.T @ X + 1e-9 * P
-        R = sla_lib.cholesky(XpX, lower=False)
-        Rinv = sla_lib.solve_triangular(R, lib.eye(k_shock))
+        R = jsp.linalg.cholesky(XpX, lower=False)
+        Rinv = jsp.linalg.solve_triangular(R, jnp.eye(k_shock))
         RTinv_P_Rinv = Rinv.T @ P @ Rinv
-        s, U = lib.linalg.eigh(RTinv_P_Rinv)
+        s, U = jnp.linalg.eigh(RTinv_P_Rinv)
         A = X @ Rinv @ U
         b = A.T @ y
 
-        ypy = lib.sum(lib.square(y))
+        ypy = jnp.sum(jnp.square(y))
         ApA = A.T @ A
 
         def eval_f(lam):
-            d = 1 / (1 + n * lam * s)
+            d = 1 / (1 + lam * s)
             bd = b * d
             rss = ypy - 2 * b.T @ bd + bd.T @ ApA @ bd
-            dfit = lib.sum(d)
+            dfit = jnp.sum(d)
             gcv = rss / (1 - dfit / n) ** 2
-            aic = lib.log(rss) + 2 * dfit / n
-            return lib.array([rss, gcv, aic, dfit])
+            aic = jnp.log(rss) + 2 * dfit / n
+            return jnp.array([rss, gcv, aic, dfit])
 
         # Build the grid and map the step function over it
-        lam_grid = lib.exp(lib.linspace(lam_grid_lower, lam_grid_upper, lam_grid_size))
-        if use_jax:
-            values = jax.vmap(eval_f)(lam_grid)
-        else:
-            values = np.array(list(map(eval_f, lam_grid)))
+        lam_grid = n * jnp.pow(
+            10, jnp.linspace(lam_grid_lower, lam_grid_upper, lam_grid_size)
+        )
+        values = jax.vmap(eval_f)(lam_grid)
 
-        argmin_gcv = lib.argmin(values[:, 1])
+        argmin_gcv = jnp.argmin(values[:, 1])
         min_gcv = lam_grid[argmin_gcv]
 
-        if not use_jax:
-            if argmin_gcv == 0 or (argmin_gcv == lam_grid_size - 1):
-                warnings.warn(
-                    f"Selected optimal penalty at the edge of the grid: {min_gcv} (pos {argmin_gcv})."
-                )
-
         return min_gcv, values
-
-    @staticmethod
-    def _fit_jax(
-        B,
-        endog,
-        shock,
-        exog,
-        input_mask,
-        mask_type: str,
-        mask_any_prev_h: bool,
-        H: int,
-        n_diff: int,
-        lam: float | None,
-        lam_grid_lower: float,
-        lam_grid_upper: float,
-        lam_grid_size: int,
-    ):
-        # Assumes that the inputs are already demeaned.
-        T, k = exog.shape
-
-        # First create the stacked Y.
-        y = jnp.repeat(endog, H + 1, axis=0).reshape((T, H + 1))
-        Y = lax.scan(
-            lambda _, v: (None, jnp.roll(v[0], -v[1])),
-            None,
-            (y.T, np.arange(H + 1)),
-        )[1].T
-        # Build the mask for out of bounds observations.
-        mask = np.arange(T).reshape((T, 1)) + np.arange(H + 1).reshape((1, H + 1))
-        mask = mask < T
-        # Apply the covid mask
-        if input_mask is not None:
-            if mask_type in ("x", "both"):
-                mask = mask & input_mask.reshape((T, 1))
-            if mask_type in ("y", "both"):
-                input_mask = jnp.repeat(input_mask, H + 1, axis=0).reshape((T, H + 1))
-                input_mask = lax.scan(
-                    lambda _, v: (None, jnp.roll(v[0], -v[1])),
-                    None,
-                    (input_mask.T, np.arange(H + 1)),
-                )[1].T
-                mask = mask & input_mask
-        # Build the stacked arrays
-        X = exog.reshape((T, 1, k))
-        X = jnp.repeat(X, H + 1, axis=1)
-        s = B[jnp.newaxis, ...] * shock.reshape((T, 1, 1))
-        X = jnp.concat((s, X), axis=2)
-        # Apply the mask
-        X = X * mask[..., jnp.newaxis]
-        Y = Y * mask
-        N = jnp.sum(mask)
-
-        Y_flat = Y.flatten()
-        X_flat = X.reshape((T * (H + 1)), H + 1 + k)
-
-        # Build the penalty matrix
-        P = jnp.zeros((H + 1 + k, H + 1 + k))
-        D = jnp.eye(H + 1)
-        for i in range(n_diff):
-            D = jnp.diff(D, axis=0)
-        P = P.at[: (H + 1), : (H + 1)].set(D.T @ D)
-
-        # Lambda tuning
-        if lam is None:
-            lam, tune_trace = SmoothLocalProjection._tune_lambda(
-                X_flat,
-                Y_flat,
-                P,
-                N,
-                H + 1,
-                lam_grid_lower,
-                lam_grid_upper,
-                lam_grid_size,
-                True,
-            )
-        else:
-            tune_trace = None
-
-        # Compute the coefficients
-        XpX_lam = X_flat.T @ X_flat + N * lam * P
-        XpX_lam_inv = invert_jax(XpX_lam)
-        theta_hat = XpX_lam_inv @ X_flat.T @ Y_flat
-        u = Y - jnp.einsum("thk,k->th", X, theta_hat)
-
-        X_masked = jnp.where(mask[..., jnp.newaxis], X, 0.0)
-        return X_masked, Y, P, ~mask[..., jnp.newaxis], u, theta_hat, lam, tune_trace
 
 
 @dataclass
@@ -390,11 +325,12 @@ class SmoothLocalProjectionResult:
 
     lam: float
     coef: np.ndarray
+    vcov_nw: np.ndarray
     tune_trace: np.ndarray | None
 
     _Xs: np.ndarray | None
     _Ys: np.ndarray | None
-    _omit: np.ndarray | None
+    _mask: np.ndarray | None
     _us: np.ndarray | None
     _engine: str = "np"
 
@@ -404,18 +340,16 @@ class SmoothLocalProjectionResult:
 
     @cached_property
     def B(self):
-        b = bspline(self.model.p + 1, self.knots, np.arange(self.H + 1))
-        b = b / np.sum(b, axis=1)[:, np.newaxis]
-        return b
+        return self.model.B
 
     @cached_property
     def irf(self):
-        B = self.B
+        B = self.model.B
         n_splines = B.shape[1]
         n_shocks = self.model.shock.shape[1]
         irfs = [
             (
-                self.B @ self.coef[i * n_splines : (i + 1) * n_splines].reshape((-1, 1))
+                B @ self.coef[i * n_splines : (i + 1) * n_splines].reshape((-1, 1))
             ).flatten()
             for i in range(n_shocks)
         ]
@@ -425,69 +359,8 @@ class SmoothLocalProjectionResult:
         return irf
 
     @cached_property
-    def vcov_nw(self):
-        N = np.sum(~self._omit)
-        if self._engine == "jax":
-            return self._vcov_nw_jax(self._Xs, self._us, N, self.lam, self.P)
-        else:
-            return self._vcov_nw_inner(self._Xs, self._us, N, self.lam, self.P, False)
-
-    @staticmethod
-    @jax.jit
-    def _vcov_nw_jax(Xs, us, N, lam, P):
-        return SmoothLocalProjectionResult._vcov_nw_inner(Xs, us, N, lam, P, True)
-
-    @staticmethod
-    def _vcov_nw_inner(X, u, N, lam, P, use_jax=False):
-        np_lib = jnp if use_jax else np
-
-        T, lags = u.shape
-        k = X.shape[2]
-
-        xpx1 = np_lib.sum(np_lib.transpose(X, (0, 2, 1)) @ X, axis=0)
-        outer = xpx1 + 0.1 * N * lam * P
-        if use_jax:
-            outer = invert_jax(outer)
-        else:
-            outer = invert(outer)
-        # Compute the Gammas
-        Xpu = np_lib.einsum("thk,th->tk", X, u)
-        if use_jax:
-            Xpu = jnp.concat((jnp.zeros((lags, k)), Xpu), axis=0)
-
-            def f(lrv, h):
-                Gamma = (
-                    1
-                    / T
-                    * jnp.einsum(
-                        "tk,ti->ki",
-                        Xpu[lags : (lags + T), :],
-                        lax.dynamic_slice_in_dim(Xpu, lags - h, T),
-                    )
-                )
-                w = 1 - h / (lags + 1)
-                lrv += w * (Gamma + Gamma.T * (h > 0))
-                return lrv, None
-
-            lrv, _ = lax.scan(f, jnp.zeros((k, k)), jnp.arange(lags + 1))
-        else:
-            lrv = jnp.zeros((k, k))
-            for j in range(lags + 1):
-                Gamma = (
-                    1
-                    / T
-                    * np_lib.einsum("tk,ti->ki", Xpu[j:, ...], Xpu[: (T - j), ...])
-                )
-                if j == 0:
-                    lrv += Gamma
-                else:
-                    lrv += (1 - j / (lags + 1)) * (Gamma + Gamma.T)
-        vcov_nw = T * outer @ lrv @ outer
-        return vcov_nw
-
-    @cached_property
     def se(self):
-        B = self.B
+        B = self.model.B
         n_splines = B.shape[1]
         n_shocks = self.model.shock.shape[1]
         lib = jnp if self._engine == "jax" else np
