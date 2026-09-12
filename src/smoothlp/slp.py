@@ -66,6 +66,8 @@ class SmoothLocalProjection(AbstractLocalProjection):
         mask_type: str = "both",
         mask_any_prev_h: bool = True,
     ):
+        assert mask_type == "both", "Only mask_type='both' is supported"
+        assert mask_any_prev_h, "Only mask_any_prev_h=True is supported"
         super().__init__(endog, shock, exog, H, mask, mask_type)
         if fe is None:
             self.fe = tuple()
@@ -114,8 +116,6 @@ class SmoothLocalProjection(AbstractLocalProjection):
             self.endog, self.shock, self.exog = res
 
         params = {
-            "mask_type": "both",
-            "mask_any_prev_h": self.mask_any_prev_h,
             "H": self.H,
             "n_diff": self.n_diff,
             "lam": lam,
@@ -155,8 +155,6 @@ class SmoothLocalProjection(AbstractLocalProjection):
         shock: Float[Array, "T s"],
         exog: Float[Array, "T k"],
         mask: Float[Array, " T"] | None,
-        mask_type: str,
-        mask_any_prev_h: bool,
         H: int,
         n_diff: int,
         lam: float | None,
@@ -172,7 +170,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         Xs = exog
         if mask is None:
             mask = jnp.ones(T)
-        Ys, mask_s = build_stacked(endog, mask, H, mask_type)
+        Ys, mask_s = build_stacked(endog, mask, H, "both")
         N = jnp.sum(mask_s)
 
         # Partial out the exogenous variables
@@ -240,7 +238,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
             tune_trace = None
 
         XpX_lam = XpX + lam * P
-        XpX_lam_inv = jnp.linalg.pinv(XpX_lam)
+        XpX_lam_inv = invert_jax(XpX_lam)
         t_Xpy = jnp.einsum("tsh, hk, th -> sk", shock_r_m, B, Ys_r_m).flatten()
         theta_hat = XpX_lam_inv @ t_Xpy
         theta_hat_s = theta_hat.reshape(n_shocks, n_splines)
@@ -273,7 +271,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         lrv = cross + cross.T
 
         XpX_small_P = XpX + 0.1 * lam * P
-        XpX_inv = jnp.linalg.pinv(XpX_small_P)
+        XpX_inv = invert_jax(XpX_small_P)
         vcov_nw = XpX_inv @ lrv @ XpX_inv
 
         return shock_r_m, Ys, P, mask_s, u, theta_hat, vcov_nw, lam, tune_trace
