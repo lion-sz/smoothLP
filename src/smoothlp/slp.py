@@ -13,8 +13,8 @@ from smoothlp.utils import bspline, demean, invert_jax
 
 
 def build_stacked(
-    endog: Float[Array, "T"],
-    mask: Float[Array, "T"],
+    endog: Float[Array, " T"],
+    mask: Float[Array, " T"],
     H: int,
     mask_type: str = "both",
 ) -> tuple[Float[Array, "T H+1"], Float[Array, "T H+1"]]:
@@ -86,31 +86,19 @@ class SmoothLocalProjection(AbstractLocalProjection):
 
     @property
     def knots(self):
-        return np.arange(-2, self.H - 1).astype(np.float64)
+        """Compute the knots.
+
+        Note, that I'm deviating from the paper here and agree with the R code.
+        The left most knot is at H_min -3 not -2.
+        Without this I'm running into this peculiarity that the splines do not
+        always sum up to 1, which then messes with the penalty.
+        """
+        return np.arange(-3, self.H).astype(np.float64)
 
     @property
     def B(self):
-        B = bspline(self.p + 1, self.knots, np.arange(self.H + 1))
-        # B = B[:, :-2]
-        B = B / np.sum(B, axis=1)[:, np.newaxis]
+        B = bspline(self.p, self.knots, np.arange(self.H + 1))
         return B
-        # TODO: Potential issue here.
-        #   I believe there is a strange interaction between penalty and the splines
-        #   hidden here. Specifically, If I use too few splines, then the sums
-        #   over all splines are not 1 for each horizon. Then the coefficients scale,
-        #   to account for this. But since the penalty applies to the coefficients,
-        #   if is effectively not scale invariant.
-        #   But when I use more than H+1 splines, I run into singularities.
-        #   Therefore I rescale the splines.
-        #   Note: replaced normalization with boundary trimming — drop p-1 columns
-        #   from each end so all retained splines have complete support on [0, H],
-        #   avoiding the scale interaction with the penalty (matches Julia).
-
-        # New Version:
-        # knots = np.arange(-(self.p + 1), self.H + self.p - 1).astype(np.float64)
-        # B = bspline(self.p + 1, knots, np.arange(self.H + 1))
-        # B = B[:, self.p: B.shape[1] - self.p - 2]
-        # print(B.shape)
 
     def fit(
         self,
@@ -162,11 +150,11 @@ class SmoothLocalProjection(AbstractLocalProjection):
 
     @staticmethod
     def _fit(
-        B,
-        endog,
-        shock,
-        exog,
-        mask,
+        B: Float[Array, "{H}+1 b"],
+        endog: Float[Array, " T"],
+        shock: Float[Array, "T s"],
+        exog: Float[Array, "T k"],
+        mask: Float[Array, " T"] | None,
         mask_type: str,
         mask_any_prev_h: bool,
         H: int,
@@ -188,34 +176,46 @@ class SmoothLocalProjection(AbstractLocalProjection):
         N = jnp.sum(mask_s)
 
         # Partial out the exogenous variables
-        XpX = jnp.einsum("ti,tj,th->ijh", Xs, Xs, mask_s)
-        XpX_inv = jax.vmap(invert_jax, in_axes=-1, out_axes=-1)(XpX)
+        XpX_partial = jnp.einsum("ti,tj,th->ijh", Xs, Xs, mask_s)
+        XpX_partial_inv = jax.vmap(invert_jax, in_axes=-1, out_axes=-1)(XpX_partial)
 
-        Ys_partial = jnp.einsum(
-            "tj,jkh,qk,qh, qh->th", Xs, XpX_inv, Xs, mask_s, Ys, optimize="greedy"
+        Ys_partial: Float[Array, "T H+1"] = jnp.einsum(
+            "tj,jkh,qk,qh, qh->th",
+            Xs,
+            XpX_partial_inv,
+            Xs,
+            mask_s,
+            Ys,
+            optimize="greedy",
         )
         Ys_r = Ys - Ys_partial
         Ys_r_m = Ys_r * mask_s
 
-        Bs = jnp.einsum("hk,ts->thsk", B, shock)
-        Bs = Bs.reshape(T, H + 1, n_splines * shock.shape[1])
-        Bs_partial = jnp.einsum(
-            "ti, ikh, qk, qh, qhj -> thj",
+        shock_partial: Float[Array, "T H+1"] = jnp.einsum(
+            "tj,jkh,qk,qh,qs->tsh",
             Xs,
-            XpX_inv,
+            XpX_partial_inv,
             Xs,
             mask_s,
-            Bs,
+            shock,
             optimize="greedy",
         )
-        Bs_r_m = Bs - Bs_partial
-        Bs_r_m = Bs_r_m * mask_s[..., jnp.newaxis]
+        shock_r = shock[..., jnp.newaxis] - shock_partial
+        shock_r_m = shock_r * mask_s[:, jnp.newaxis, :]
 
+        Bs_r_m = jnp.einsum("tsh,hk->thsk", shock_r_m, B)
+        Bs_r_m = Bs_r_m.reshape(T, H + 1, n_splines * shock.shape[1])
         Y_r_m = Ys_r_m.reshape(T * (H + 1))
-        B_r_m = Bs_r_m.reshape(T * (H + 1), n_splines)
+        B_r_m = Bs_r_m.reshape(T * (H + 1), n_splines * n_shocks)
+
+        # Set up the main matrix
+        q = n_shocks * n_splines
+        XpX = jnp.einsum("tih,tjh,hk,hl->ikjl", shock_r_m, shock_r_m, B, B).reshape(
+            q, q
+        )
 
         # Build the penalty matrix
-        P = jnp.zeros((n_splines * n_shocks, n_splines * n_shocks))
+        P = jnp.zeros((q, q))
         D = jnp.eye(n_splines)
         for i in range(n_diff):
             D = jnp.diff(D, axis=0)
@@ -226,81 +226,99 @@ class SmoothLocalProjection(AbstractLocalProjection):
                 (i * n_splines) : (i + 1) * n_splines,
             ].set(temp)
         if lam is None:
+            Xpy = jnp.einsum("tsh, th, hk -> sk", shock_r_m, Ys_r_m, B).reshape(q)
+            ypy = jnp.sum(jnp.square(Y_r_m))
+            n_fitted = k * (H + 1)
             lam, tune_trace = SmoothLocalProjection._tune_lambda(
-                B_r_m,
-                Y_r_m,
+                XpX,
+                Xpy,
+                ypy,
                 P,
                 N,
-                n_splines * n_shocks,
                 lam_grid_lower,
                 lam_grid_upper,
                 lam_grid_size,
+                n_fitted,
             )
         else:
             tune_trace = None
 
-        XtX_lam = B_r_m.T @ B_r_m + lam * P
-        XtX_lam_inv = jnp.linalg.pinv(XtX_lam)
-        theta_hat = XtX_lam_inv @ (B_r_m.T @ Y_r_m)
-        u = Ys_r - jnp.einsum("thk,k->th", Bs_r_m, theta_hat)
-        u = u
+        XpX_lam = XpX + lam * P
+        XpX_lam_inv = jnp.linalg.pinv(XpX_lam)
+        theta_hat = XpX_lam_inv @ (B_r_m.T @ Y_r_m)
+        theta_hat_s = theta_hat.reshape(n_shocks, n_splines)
+        ys_hat = jnp.einsum("tsh, hk, sk -> th", shock_r_m, B, theta_hat_s)
+        u = Ys_r - ys_hat
 
         # Compute the covariance matrix for the splines.
-        Xu = jnp.einsum("thk,th->tk", Bs_r_m, u)
-        Xu_past = Xu
-        d_vcov = Bs_r_m.shape[2]
+        # I first accumulate the weighted Xu values,
+        # before multiplying them once with the Xu to get the cross
+        # product. I basically first accumulate and only then multiply.
+        # This makes the computation much faster.
+        def accumulate(carry, lag):
+            shifted, weighted = carry
 
-        def comp_gamma(carry, l):
-            Xu_past, lrv = carry
-            gamma = Xu.T @ Xu_past
-            Xu_past = jnp.roll(Xu_past.at[0, ...].set(0.0), -1, axis=0)
-            lrv = lrv + (1 - l / (H + 1)) * (gamma + gamma.T * (l > 0))
-            return (Xu_past, lrv), gamma
+            # Advance one time step, zero-padding instead of wrapping.
+            shifted = jnp.roll(shifted, -1, axis=0).at[-1].set(0.0)
+            weight = 1.0 - lag / (H + 1)
+            return (shifted, weighted + weight * shifted), None
 
-        (_, lrv), gammas = lax.scan(
-            comp_gamma, (Xu_past, jnp.zeros((d_vcov, d_vcov))), np.arange(H + 1)
+        Xu = jnp.einsum("tsh, th, hk -> tsk", shock_r_m, u, B)
+        Xu = Xu.reshape(T, n_shocks * n_splines)
+
+        (_, weighted), _ = lax.scan(
+            accumulate,
+            (Xu, 0.5 * Xu),
+            jnp.arange(1, H + 1),
         )
 
-        XpX = jnp.einsum("thi,thj->ij", Bs_r_m, Bs_r_m) + 0.1 * lam * P
-        XpX_inv = jnp.linalg.pinv(XpX)
+        cross = Xu.T @ weighted
+        lrv = cross + cross.T
+
+        XpX_small_P = XpX + 0.1 * lam * P
+        XpX_inv = jnp.linalg.pinv(XpX_small_P)
         vcov_nw = XpX_inv @ lrv @ XpX_inv
 
         return Bs_r_m, Ys, P, mask_s, u, theta_hat, vcov_nw, lam, tune_trace
 
     @staticmethod
     def _tune_lambda(
-        X,
-        y,
+        XpX,
+        Xpy,
+        ypy,
         P,
         n: int,
-        k_shock: int,
         lam_grid_lower: float,
         lam_grid_upper: float,
         lam_grid_size: int,
+        n_fitted: int,
     ):
         """Tune lambda using Demmler-Reinsch Orthogonalization
 
         This procedure was adopted from the LocalProjections Julia package.
         See Rupper (2003), appendix B.1.1 for a reference.
         """
-
-        # Set up the orthogonalization
-        XpX = X.T @ X + 1e-9 * P
-        R = jsp.linalg.cholesky(XpX, lower=False)
-        Rinv = jsp.linalg.solve_triangular(R, jnp.eye(k_shock))
+        # This matrix is rank deficint (more splines than horizons).
+        # To make it well behaved, I add a rather strong penalty to it.
+        # Note, that I need to subtract this later on.
+        penalty_scale = jnp.minimum(jnp.max(jnp.abs(P)), 1.0)
+        reference_lam = jnp.max(jnp.abs(XpX)) / penalty_scale
+        R = jsp.linalg.cholesky(XpX + reference_lam * P, lower=False)
+        Rinv = jsp.linalg.solve_triangular(R, jnp.eye(XpX.shape[0]))
         RTinv_P_Rinv = Rinv.T @ P @ Rinv
         s, U = jnp.linalg.eigh(RTinv_P_Rinv)
-        A = X @ Rinv @ U
-        b = A.T @ y
-
-        ypy = jnp.sum(jnp.square(y))
-        ApA = A.T @ A
+        s = jnp.maximum(s, 0.0)  # P is positive semidefinite
+        jax.debug.print("Condition number: {cond}", cond=jnp.max(s) / jnp.min(s + 1e-9))
+        Z = Rinv @ U
+        b = Z.T @ Xpy
+        ApA = Z.T @ XpX @ Z
 
         def eval_f(lam):
-            d = 1 / (1 + lam * s)
+            d = 1 / (1 + (lam - reference_lam) * s)
             bd = b * d
             rss = ypy - 2 * b.T @ bd + bd.T @ ApA @ bd
-            dfit = jnp.sum(d)
+            # A is whitened at reference_lam, so A.T @ A is not identity.
+            dfit = jnp.sum(jnp.diag(ApA) * d) + n_fitted
             gcv = rss / (1 - dfit / n) ** 2
             aic = jnp.log(rss) + 2 * dfit / n
             return jnp.array([rss, gcv, aic, dfit])
