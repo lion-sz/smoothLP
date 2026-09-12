@@ -129,7 +129,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         res = jax.block_until_ready(
             engine_fn(self.B, self.endog, self.shock, self.exog, self.mask)
         )
-        X, Y, P, mask, u, theta_hat, vcov_nw, lam, tune_trace = (
+        shock, Y, P, mask, u, theta_hat, vcov_nw, lam, tune_trace = (
             np.array(r) for r in res
         )
         print(f"Runtime of {(datetime.now() - s).total_seconds()}s")
@@ -142,7 +142,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
             theta_hat,
             vcov_nw,
             tune_trace,
-            _Xs=X,
+            _Xs=shock,
             _Ys=Y,
             _mask=mask,
             _us=u,
@@ -190,6 +190,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         )
         Ys_r = Ys - Ys_partial
         Ys_r_m = Ys_r * mask_s
+        Y_r_m = Ys_r_m.reshape(T * (H + 1))
 
         shock_partial: Float[Array, "T H+1"] = jnp.einsum(
             "tj,jkh,qk,qh,qs->tsh",
@@ -202,11 +203,6 @@ class SmoothLocalProjection(AbstractLocalProjection):
         )
         shock_r = shock[..., jnp.newaxis] - shock_partial
         shock_r_m = shock_r * mask_s[:, jnp.newaxis, :]
-
-        Bs_r_m = jnp.einsum("tsh,hk->thsk", shock_r_m, B)
-        Bs_r_m = Bs_r_m.reshape(T, H + 1, n_splines * shock.shape[1])
-        Y_r_m = Ys_r_m.reshape(T * (H + 1))
-        B_r_m = Bs_r_m.reshape(T * (H + 1), n_splines * n_shocks)
 
         # Set up the main matrix
         q = n_shocks * n_splines
@@ -245,7 +241,8 @@ class SmoothLocalProjection(AbstractLocalProjection):
 
         XpX_lam = XpX + lam * P
         XpX_lam_inv = jnp.linalg.pinv(XpX_lam)
-        theta_hat = XpX_lam_inv @ (B_r_m.T @ Y_r_m)
+        t_Xpy = jnp.einsum("tsh, hk, th -> sk", shock_r_m, B, Ys_r_m).flatten()
+        theta_hat = XpX_lam_inv @ t_Xpy
         theta_hat_s = theta_hat.reshape(n_shocks, n_splines)
         ys_hat = jnp.einsum("tsh, hk, sk -> th", shock_r_m, B, theta_hat_s)
         u = Ys_r - ys_hat
@@ -279,7 +276,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         XpX_inv = jnp.linalg.pinv(XpX_small_P)
         vcov_nw = XpX_inv @ lrv @ XpX_inv
 
-        return Bs_r_m, Ys, P, mask_s, u, theta_hat, vcov_nw, lam, tune_trace
+        return shock_r_m, Ys, P, mask_s, u, theta_hat, vcov_nw, lam, tune_trace
 
     @staticmethod
     def _tune_lambda(
