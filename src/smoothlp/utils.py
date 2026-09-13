@@ -1,5 +1,8 @@
+from typing import Literal
+
 import numpy as np
 from scipy import linalg as sla
+import jax
 from jax import numpy as jnp, scipy as jsp, Array, lax
 from jaxtyping import Float
 
@@ -165,13 +168,216 @@ def np_vmap(f, in_axes=0, out_axes=0):
     return mapped
 
 
-def invert(X):
+def _build_stacked_np(
+    endog: Float[np.ndarray, " T"],
+    mask: Float[np.ndarray, " T"],
+    H: int,
+    mask_type: str = "both",
+) -> tuple[Float[np.ndarray, "T H+1"], Float[np.ndarray, "T H+1"]]:
+    """Stack outcomes and binary inclusion masks (1 keeps, 0 omits).
+
+    For 'both', every date from t through t+h must be included. Outcome
+    values wrap beyond the sample, but their inclusion flags are always zero.
+    """
+    T = len(endog)
+    Ys = np.empty((T, H + 1), dtype=endog.dtype)
+    mask_s = np.empty((T, H + 1), dtype=mask.dtype)
+    current_mask = mask.copy() if mask_type in ("both", "y") else np.ones_like(mask)
+    for h in range(H + 1):
+        Ys[:, h] = np.roll(endog, -h)
+        mask_s[:, h] = current_mask
+        next_mask = np.roll(current_mask, -1)
+        if mask_type == "both":
+            next_mask[current_mask == 0] = 0
+        next_mask[-1] = 0
+        current_mask = next_mask
+    if mask_type in ("both", "x"):
+        mask_s *= mask[:, np.newaxis]
+    return Ys, mask_s
+
+
+def _build_stacked_jax(
+    endog: Float[Array, " T"],
+    mask: Float[Array, " T"],
+    H: int,
+    mask_type: str = "both",
+) -> tuple[Float[Array, "T H+1"], Float[Array, "T H+1"]]:
+    """JAX equivalent of build_stacked_np; mask uses 1=include, 0=omit."""
+
+    def fy(ty, _):
+        typ = jnp.roll(ty, -1)
+        return typ, ty
+
+    Ys = lax.scan(fy, endog, length=H + 1)[1]
+    Ys = Ys.swapaxes(0, 1)
+
+    def fm(tm, _):
+        tmp = jnp.roll(tm, -1)
+        if mask_type == "both":
+            tmp = jnp.where(tm == 0, 0, tmp)
+        tmp = tmp.at[-1].set(0)
+        return tmp, tm
+
+    if mask_type in ("both", "y"):
+        start = mask
+    else:
+        start = jnp.ones_like(mask)
+    mask_s = lax.scan(fm, start, length=H + 1)[1]
+    mask_s = mask_s.swapaxes(0, 1)
+    if mask_type in ("both", "x"):
+        mask_s = mask_s * mask[:, np.newaxis]
+
+    return Ys, mask_s
+
+
+def build_stacked(
+    engine: Literal["jax", "np"],
+    endog: Float[Array, " T"],
+    mask: Float[Array, " T"],
+    H: int,
+    mask_type: str = "both",
+) -> tuple[Float[Array, "T H+1"], Float[Array, "T H+1"]]:
+    if engine == "jax":
+        return _build_stacked_jax(endog, mask, H, mask_type)
+    elif engine == "np":
+        return _build_stacked_np(endog, mask, H, mask_type)
+    else:
+        raise ValueError(f"Can only use jax or np as engine, not '{engine}'.")
+
+
+def _partial_out_jax(
+    Ys: Float[Array, "T H+1"],
+    shock: Float[Array, "T s"],
+    exog: Float[Array, "T k"],
+    mask_s: Float[Array, "T H+1"],
+    leverage: bool,
+):
+    # Partial out the regressors
+    XpX = jnp.einsum("ti,tj,th->ijh", exog, exog, mask_s)
+    XpX_inv = jax.vmap(_invert_jax, in_axes=-1, out_axes=-1)(XpX)
+    if leverage:
+        X_leverage = jnp.einsum("ti,ijh,tj->th", exog, XpX_inv, exog) * mask_s
+    else:
+        X_leverage = None
+
+    Ys_partial: Float[Array, "T H+1"] = jnp.einsum(
+        "tj,jkh,qk,qh, qh->th",
+        exog,
+        XpX_inv,
+        exog,
+        mask_s,
+        Ys,
+        optimize="greedy",
+    )
+    Ys_r = Ys - Ys_partial
+    Ys_r_m = Ys_r * mask_s
+
+    shock_partial: Float[Array, "T H+1"] = jnp.einsum(
+        "tj,jkh,qk,qh,qs->tsh",
+        exog,
+        XpX_inv,
+        exog,
+        mask_s,
+        shock,
+        optimize="greedy",
+    )
+    shock_r = shock[..., jnp.newaxis] - shock_partial
+    shock_r_m = shock_r * mask_s[:, jnp.newaxis, :]
+
+    return Ys_r_m, shock_r_m, X_leverage
+
+
+def _partial_out_np(
+    Ys: Float[np.ndarray, "T H+1"],
+    shock: Float[np.ndarray, "T s"],
+    exog: Float[np.ndarray, "T k"],
+    mask_s: Float[np.ndarray, "T H+1"],
+    leverage: bool = False,
+):
+    """Return masked outcome/shock residuals and control leverage per horizon."""
+    # XpX = np.einsum("ti,tj,th->ijh", exog, exog, mask_s)  # This does not use blas...
+    XpX = np.stack(
+        [exog.T @ (exog * mask_s[:, h, None]) for h in range(mask_s.shape[1])],
+        axis=-1,
+    )
+    XpX_inv = np_vmap(np.linalg.inv, in_axes=-1, out_axes=-1)(XpX)
+    if leverage:
+        # X_leverage = np.einsum("ti,ijh,tj->th", exog, XpX_inv, exog, optimize=["einsum_path", (0, 1), (0, 1)]) * mask_s
+        X_leverage = np.empty_like(mask_s, dtype=XpX_inv.dtype)
+
+        for h in range(mask_s.shape[1]):
+            A_h = np.ascontiguousarray(XpX_inv[:, :, h])
+            XA = exog @ A_h
+            X_leverage[:, h] = np.einsum("ti,ti->t", XA, exog) * mask_s[:, h]
+    else:
+        X_leverage = None
+
+    Ys_partial = np.einsum(
+        "tj,jkh,qk,qh,qh->th",
+        exog,
+        XpX_inv,
+        exog,
+        mask_s,
+        Ys,
+        optimize="greedy",
+    )
+    Ys_r_m = (Ys - Ys_partial) * mask_s
+
+    shock_partial = np.einsum(
+        "tj,jkh,qk,qh,qs->tsh",
+        exog,
+        XpX_inv,
+        exog,
+        mask_s,
+        shock,
+        optimize="greedy",
+    )
+    shock_r_m = (shock[..., np.newaxis] - shock_partial) * mask_s[:, np.newaxis, :]
+    return Ys_r_m, shock_r_m, X_leverage
+
+
+def partial_out(engine: Literal["jax", "np"], Ys, shock, exog, mask_s, leverage: bool):
+    """Partial out controls using binary inclusion masks (1 keeps, 0 omits)."""
+    if exog is None and engine in ("jax", "np"):
+        lib = jnp if engine == "jax" else np
+        return (
+            Ys * mask_s,
+            shock[:, :, None] * mask_s[:, None, :],
+            lib.zeros_like(mask_s) if leverage else None,
+        )
+    if engine == "jax":
+        return _partial_out_jax(Ys, shock, exog, mask_s, leverage)
+    elif engine == "np":
+        return _partial_out_np(Ys, shock, exog, mask_s, leverage)
+    else:
+        raise ValueError(f"Can only use jax or np as engine, not '{engine}'.")
+
+
+def _invert_np(X):
     U = sla.cholesky(X)
     U_inv = sla.solve_triangular(U, np.eye(X.shape[0]))
     return U_inv @ U_inv.T
 
 
-def invert_jax(X):
+def _invert_jax(X):
     U = jsp.linalg.cholesky(X)
     U_inv = jsp.linalg.solve_triangular(U, jnp.eye(X.shape[0]))
     return U_inv @ U_inv.T
+
+
+def invert(engine: Literal["jax", "np"], X, in_axes: int | None = None):
+    if engine == "jax":
+        if in_axes is None:
+            return _invert_jax(X)
+        else:
+            return jax.vmap(_invert_jax, in_axes=2, out_axes=2)(X)
+    elif engine == "np":
+        if in_axes is None:
+            return _invert_np(X)
+        else:
+            if in_axes != len(X.shape) - 1:
+                raise ValueError("Currently can only map along last axis")
+            res = [_invert_np(X[..., h]) for h in range(X.shape[-1])]
+            return np.stack(res, axis=in_axes)
+    else:
+        raise ValueError(f"Can only use jax or np as engine, not '{engine}'")

@@ -36,7 +36,7 @@ class AbstractLocalProjection:
                 Can be 1D (single shock) or 2D (multiple shocks).
             exog (np.ndarray, 2d): The exogenous variables.
             H (int): The local projection horizon.
-            mask (np.ndarray, 1d): The mask variable.
+            mask (np.ndarray, 1d): Boolean mask; True omits an observation.
             mask_type (str): The mask type to use.
                 Must be one of `x`, `y`, or `both` (default).
             diff (np.ndarray, 1d): Optional differencing term aligned with X_t.

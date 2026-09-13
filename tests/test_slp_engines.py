@@ -13,7 +13,7 @@ from tests.slp_reference import (
 )
 
 
-@pytest.mark.parametrize("H,n_shocks", [(8, 1), (8, 2), (8, 4), (19, 2)])
+@pytest.mark.parametrize("H,n_shocks", [(100, 1), (100, 2), (100, 4), (19, 2)])
 @pytest.mark.parametrize("masked", [False, True], ids=["complete", "gaps"])
 @pytest.mark.parametrize("lam", [1.0, 1000.0], ids=["weak", "strong"])
 def test_slp_matches_expanded_reference(H, n_shocks, masked, lam):
@@ -26,12 +26,12 @@ def test_slp_matches_expanded_reference(H, n_shocks, masked, lam):
 
 def test_slp_shock_permutation():
     y, shocks, controls, mask = simulated_data(n_shocks=4, masked=True)
-    model = SmoothLocalProjection(y, shocks, controls, H=8, mask=mask)
+    model = SmoothLocalProjection(y, shocks, controls, H=100, mask=mask)
     original = model.fit(10.0)
     order = np.array([2, 0, 3, 1])
-    permuted = SmoothLocalProjection(y, shocks[:, order], controls, H=8, mask=mask).fit(
-        10.0
-    )
+    permuted = SmoothLocalProjection(
+        y, shocks[:, order], controls, H=100, mask=mask
+    ).fit(10.0)
     q = model.B.shape[1]
     indices = np.concatenate([np.arange(a * q, (a + 1) * q) for a in order])
     for actual, expected in (

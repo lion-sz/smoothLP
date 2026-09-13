@@ -2,7 +2,8 @@
 
 Do not reuse production stacking, residualization, penalty, tuning, or covariance
 helpers. The supplied public B is shared: these tests target estimation rather
-than spline construction. Binary masks use the current 'both' convention.
+than spline construction. Binary masks exclude any interval containing an
+omitted observation, including its endpoints.
 """
 
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ import numpy as np
 from numpy.testing import assert_allclose
 
 
-def simulated_data(T=160, n_shocks=2, n_controls=3, seed=812, masked=False):
+def simulated_data(T=320, n_shocks=2, n_controls=3, seed=812, masked=False):
     rng = np.random.default_rng(seed)
     controls = np.column_stack((np.ones(T), rng.normal(size=(T, n_controls - 1))))
     common = rng.normal(size=(T, 1))
@@ -27,9 +28,10 @@ def simulated_data(T=160, n_shocks=2, n_controls=3, seed=812, masked=False):
     y[1:] += 0.4 * signal[:-1]
     mask = None
     if masked:
-        mask = np.ones(T)
-        mask[11::17] = 0
-        mask[T // 3 : T // 3 + 5] = 0
+        mask = np.zeros(T, dtype=bool)
+        # Retain long uninterrupted stretches for the H=100 reference checks.
+        mask[11] = True
+        mask[T // 3 : T // 3 + 5] = True
     return y, shocks, controls, mask
 
 
@@ -37,13 +39,15 @@ def stacked_reference(y, shocks, controls, B, n_diff, mask=None):
     """Invalid rows stay zero at their original times, including internal gaps."""
     T, s = shocks.shape
     horizons, q = B.shape
-    mask = np.ones(T, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    mask = np.ones(T, dtype=bool) if mask is None else ~np.asarray(mask, dtype=bool)
     X = np.zeros((T, horizons, s * q))
     Y = np.zeros((T, horizons))
     n = 0
     for h in range(horizons):
         times = np.arange(T - h)
-        times = times[mask[times] & mask[times + h]]
+        times = times[np.array([mask[t : t + h + 1].all() for t in times], dtype=bool)]
+        if not len(times):
+            continue
         W = controls[times]
         assert np.linalg.matrix_rank(W) == W.shape[1]
         Q, _ = np.linalg.qr(W, mode="reduced")

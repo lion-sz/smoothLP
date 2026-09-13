@@ -1,14 +1,14 @@
 from dataclasses import dataclass
 from functools import partial
+from typing import Literal
 
 import jax
 import numpy as np
-from jax import lax
-from jax import numpy as jnp
-from scipy import linalg as sla
+from jax import numpy as jnp, Array
 from statsmodels import api as sm
+from jaxtyping import Float
 
-from smoothlp.utils import comp_lrv
+from smoothlp.utils import comp_lrv, build_stacked, partial_out, invert
 from smoothlp.models import AbstractLocalProjection, AbstractLocalProjectionResult
 
 
@@ -37,6 +37,8 @@ class LocalProjection(AbstractLocalProjection):
     def fit(self, vcov="HC3", engine="np") -> "LocalProjectionResult":
         """Fit the local projection and return a :class:`LocalProjectionResult`
 
+        All engines return only shock coefficients and their covariance block.
+
         Args:
             vcov (str): The variance-covariance estimator.
                 Must be one of `non-robust`, `HC1`, `HC3` (default), or `HAC`.
@@ -51,188 +53,144 @@ class LocalProjection(AbstractLocalProjection):
             f"vcov '{vcov}' not recognised."
         )
 
-        if self.exog is not None:
-            if engine == "jax":
-                X = jnp.concatenate((self.shock, self.exog), axis=1)
-            else:
-                X = np.concatenate((self.shock, self.exog), axis=1)
-        else:
-            X = self.shock
-
         if engine == "np":
             engine_func = LocalProjection._estimation_np
         elif engine == "jax":
-            assert self.mask is None, "Mask is not yet supported in jax engine."
             engine_func = LocalProjection._estimation_jax
         else:
             engine_func = LocalProjection._estimation_sm
+
+        inclusion_mask = None if self.mask is None else (~self.mask).astype(float)
         coef, vcov_vals = engine_func(
             self.endog,
-            X,
+            self.shock,
+            self.exog,
             self.H,
             vcov,
             self.diff,
-            self.mask,
+            inclusion_mask,
             self.mask_type,
         )
 
         return LocalProjectionResult(self, coef, vcov_vals, vcov, engine)
 
     @staticmethod
-    def _estimation_np(
-        Y: np.ndarray,
-        X: np.ndarray,
-        H: int,
-        vcov_type: str,
-        diff: np.ndarray | None,
-        mask: np.ndarray | None,
-        mask_type: str = "both",
-    ):
-        T, k = X.shape
-        coef = np.zeros((H + 1, k))
-        vcov = np.zeros((H + 1, k, k))
-
-        for h in range(H + 1):
-            tx = X[: (T - h), :]
-            if diff is None:
-                ty = Y[h:]
-            else:
-                ty = Y[h:] - diff[: (T - h)]
-
-            if mask is not None:
-                if mask_type == "x":
-                    tm = mask[: (T - h)]
-                elif mask_type == "y":
-                    tm = mask[h:]
-                else:
-                    mask = mask | np.roll(mask, -1)
-                    tm = mask[: (T - h)]
-                tx = tx[~tm, :]
-                ty = ty[~tm]
-
-            U = sla.cholesky(tx.T @ tx)
-            Uinv = np.linalg.inv(U)
-            XpX_inv = Uinv @ Uinv.T
-            est_mat = XpX_inv @ tx.T
-            tc = est_mat @ ty
-            coef[h, :] = tc
-
-            if vcov_type is not None:
-                t, k = tx.shape
-                resid = ty - tx @ tc
-                if vcov_type == "non-robust":
-                    vcov[h, :, :] = np.sum(np.square(resid)) / (t - k) * XpX_inv
-                elif vcov_type == "HC1":
-                    vcov[h, :, :] = (
-                        (t / (t - k))
-                        * (est_mat * np.square(resid).reshape((1, t)))
-                        @ est_mat.T
-                    )
-                elif vcov_type == "HC3":
-                    ktt = np.einsum("ij,ji->i", tx, est_mat)
-                    u_star = np.square(resid / (1 - ktt)).reshape((1, t))
-                    vcov[h, :, :] = (est_mat * u_star) @ est_mat.T
-                elif vcov_type == "HAC":
-                    vcov[h, :, :] = LocalProjection._vcov_nw(
-                        tx,
-                        XpX_inv,
-                        resid,
-                        h + 1,
-                    )
-                else:
-                    raise ValueError(f"Strange vcov encountered: '{vcov_type}'")
-
-        return coef, vcov
-
-    @staticmethod
-    def _vcov_nw(X: np.ndarray, XpX_inv: np.ndarray, resid: np.ndarray, lags: int):
-        T, k = X.shape
-
-        Xu = X * resid[:, np.newaxis]
-        lrv = comp_lrv(Xu, lags)
-        vcov = XpX_inv @ lrv @ XpX_inv
-        vcov = (T / (T - k)) * vcov
-        return vcov
-
-    @staticmethod
     @partial(jax.jit, static_argnames=["H", "vcov_type", "mask_type"])
-    def _estimation_jax(
-        Y: np.ndarray,
-        X: np.ndarray,
+    def _estimation_jax(Y, shock, exog, H, vcov_type, diff, mask, mask_type):
+        return LocalProjection._estimation(
+            "jax", Y, shock, exog, H, vcov_type, diff, mask, mask_type
+        )
+
+    @staticmethod
+    def _estimation_np(Y, shock, exog, H, vcov_type, diff, mask, mask_type):
+        return LocalProjection._estimation(
+            "np", Y, shock, exog, H, vcov_type, diff, mask, mask_type
+        )
+
+    @staticmethod
+    def _estimation(
+        engine: Literal["jax", "np"],
+        Y: Float[Array, " T"],
+        shock: Float[Array, "T s"],
+        exog: Float[Array, "T k"],
         H: int,
         vcov_type: str,
         diff: np.ndarray | None,
-        mask: np.ndarray | None,
+        mask: Float[Array, " T"] | None,
         mask_type: str = "both",
     ):
-        assert mask is None, "Mask not yet fully supported"
-        assert diff is None, "Diff nto yet fully supported"
-        T, k = X.shape
-        XpX = X.T @ X
-        XpX_end = jnp.einsum("ti,tj->tij", X[(-H - 1) :, :], X[(-H - 1) :, :])
+        T = Y.shape[0]
+        if exog is None:
+            k = 0
+        else:
+            k = exog.shape[1]
+        s = shock.shape[1]
 
-        Y = jnp.concat([Y, np.zeros((H,))])
-        mask = jnp.ones((T,))
+        if engine == "jax":
+            lib = jnp
+        elif engine == "np":
+            lib = np
+        else:
+            raise ValueError("Can only use jax or np as engine.")
 
-        def inner(h):
-            sub_x = jnp.arange(H + 1) >= H + 1 - h
-            tmask = mask.at[-(H + 1) :].set((~sub_x).astype(float))
-            tXpX = XpX - jnp.sum(XpX_end * sub_x.reshape((H + 1, 1, 1)), axis=0)
-            XpX_inv = jnp.linalg.pinv(tXpX, hermitian=True)
-            est_mat = XpX_inv @ X.T
-            ty = lax.dynamic_slice_in_dim(Y, h, T)
-            beta = est_mat @ ty
+        # Build the stacked arrays
+        if mask is None:
+            mask = lib.ones(T)
+        Ys, mask_s = build_stacked(engine, Y, mask, H, mask_type)
+        if diff is not None:
+            Ys = Ys - diff[:, lib.newaxis]
+        Th = lib.sum(mask_s, axis=0)
 
-            XpX_inv_coll = None
-            resid_coll = None
-            vcov = None
-            if vcov_type is not None:
-                resid = tmask * (ty - X @ beta)
-                if vcov_type == "non-robust":
-                    sig_sqr = jnp.sum(jnp.square(resid)) / (T - h - k)
-                    vcov = sig_sqr * XpX_inv
-                elif vcov_type == "HC1":
-                    r = jnp.square(resid).reshape((1, T))
-                    vcov = ((T - h) / (T - h - k)) * (est_mat * r) @ est_mat.T
-                elif vcov_type == "HC3":
-                    ktt = jnp.einsum("ij,ji->i", X, est_mat)
-                    u_star = jnp.square(resid / (1 - ktt)).reshape((1, T))
-                    vcov = (est_mat * u_star) @ est_mat.T
-                else:
-                    XpX_inv_coll = XpX_inv
-                    resid_coll = resid
+        # Partial out the exogenous
+        Ys_r_m, shock_r_m, exog_leverage = partial_out(
+            engine, Ys, shock, exog, mask_s, leverage=vcov_type == "HC3"
+        )
 
-            return beta, vcov, XpX_inv_coll, resid_coll
+        # Main estimation
+        XpX = lib.einsum("tih,tjh -> ijh", shock_r_m, shock_r_m)
+        XpX_inv = invert(engine, XpX, in_axes=2)
+        # XpX_inv = jax.vmap(partial(invert, engine), in_axes=2, out_axes=2)(XpX)
+        beta = lib.einsum("ijh, tih, th -> jh", XpX_inv, shock_r_m, Ys_r_m)
+        yhat = lib.einsum("tih, ih -> th", shock_r_m, beta)
+        resid = Ys_r_m - yhat
 
-        (coef, vcov, XpX_inv_coll, resid_coll) = jax.vmap(inner)(jnp.arange(0, H + 1))
-
-        if vcov_type == "HAC":
-            lrv = LocalProjection._lrv_jax(X, resid_coll)
-            scale = ((T - jnp.arange(H + 1)) / (T - jnp.arange(H + 1) - k)).reshape(
-                (H + 1, 1, 1)
+        # Compute the standard errors
+        vcov = None
+        scale = (Th / (Th - k - s)).reshape(1, 1, H + 1)
+        if vcov_type == "non-robust":
+            sig_sqr = lib.sum(lib.square(resid), axis=0) / (Th - k - s)
+            vcov = sig_sqr * XpX_inv
+        elif vcov_type == "HC1":
+            resid_sqr = lib.square(resid)
+            inner = lib.einsum(
+                "ikh, tkh, th, tlh, ljh -> ijh",
+                XpX_inv,
+                shock_r_m,
+                resid_sqr,
+                shock_r_m,
+                XpX_inv,
             )
-            vcov = XpX_inv_coll @ lrv @ XpX_inv_coll * scale
-        return coef, vcov
-
-    @staticmethod
-    @jax.jit
-    def _lrv_jax(X, resid):
-        H = resid.shape[0] - 1
-        # comp_lrv's scan length must be static, so trace each horizon separately.
-        # Residuals already zero out observations beyond each horizon's sample.
-        return jnp.stack([comp_lrv(X * resid[h, :, None], h + 1) for h in range(H + 1)])
+            vcov = scale * inner
+        elif vcov_type == "HC3":
+            sl = lib.einsum("tih, ijh, tjh -> th", shock_r_m, XpX_inv, shock_r_m)
+            if exog_leverage is not None:
+                ktt = sl + exog_leverage
+            else:
+                ktt = sl
+            u_star = lib.square(resid / (1 - ktt))
+            vcov = lib.einsum(
+                "ikh, tkh, th, tlh, jlh -> ijh",
+                XpX_inv,
+                shock_r_m,
+                u_star,
+                shock_r_m,
+                XpX_inv,
+            )
+        if vcov_type == "HAC":
+            Xu = shock_r_m * resid[:, jnp.newaxis, :]
+            lrv = lib.stack(
+                [comp_lrv(Xu[:, :, h], h + 1) for h in range(H + 1)], axis=2
+            )
+            vcov = lib.einsum("ikh, klh, ljh -> ijh", XpX_inv, lrv, XpX_inv) * scale
+        return beta.T, lib.moveaxis(vcov, -1, 0) if vcov is not None else None
 
     @staticmethod
     def _estimation_sm(
         Y: np.ndarray,
-        X: np.ndarray,
+        shock: np.ndarray,
+        exog: np.ndarray | None,
         H: int,
         vcov_type: str,
         diff: np.ndarray | None,
         mask: np.ndarray | None,
         mask_type: str = "both",
     ):
+        mask = None if mask is None else mask == 1.0
         assert vcov_type in ("HC1", "HC3", "HAC")
+        if exog is not None:
+            X = np.concatenate((shock, exog), axis=1)
+        else:
+            X = shock
         T, k = X.shape
         coef = np.zeros((H + 1, k))
         vcov = np.zeros((H + 1, k, k))
@@ -246,15 +204,16 @@ class LocalProjection(AbstractLocalProjection):
 
             if mask is not None:
                 if mask_type == "x":
-                    tx = tx[~mask[: (T - h)]]
-                    ty = ty[~mask[: (T - h)]]
+                    tx = tx[mask[: (T - h)]]
+                    ty = ty[mask[: (T - h)]]
                 elif mask_type == "y":
-                    tx = tx[~mask[h:]]
-                    ty = ty[~mask[h:]]
+                    tx = tx[mask[h:]]
+                    ty = ty[mask[h:]]
                 elif mask_type == "both":
-                    mask = mask | np.roll(mask, -1)
-                    tx = tx[~mask[: (T - h)]]
-                    ty = ty[~mask[: (T - h)]]
+                    if h > 0:
+                        mask = mask & np.roll(mask, -1)
+                    tx = tx[mask[: (T - h)]]
+                    ty = ty[mask[: (T - h)]]
 
             tmod = sm.OLS(ty, tx).fit(
                 cov_type=vcov_type if vcov_type != "HAC" else "HC0"
@@ -267,7 +226,8 @@ class LocalProjection(AbstractLocalProjection):
             else:
                 vcov[h, :, :] = sm.stats.cov_hac(tmod, nlags=h + 1)
 
-        return coef, vcov
+        n_shocks = shock.shape[1]
+        return coef[:, :n_shocks], vcov[:, :n_shocks, :n_shocks]
 
 
 @dataclass

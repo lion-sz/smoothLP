@@ -9,37 +9,7 @@ from jax import numpy as jnp, scipy as jsp
 from jaxtyping import Float
 
 from smoothlp.models import AbstractLocalProjection
-from smoothlp.utils import bspline, demean, invert_jax
-
-
-def build_stacked(
-    endog: Float[Array, " T"],
-    mask: Float[Array, " T"],
-    H: int,
-    mask_type: str = "both",
-) -> tuple[Float[Array, "T H+1"], Float[Array, "T H+1"]]:
-    def fy(ty, _):
-        typ = jnp.roll(ty, -1)
-        return typ, ty
-
-    Ys = lax.scan(fy, endog, length=H + 1)[1]
-    Ys = Ys.swapaxes(0, 1)
-
-    def fm(tm, _):
-        tmp = jnp.roll(tm, -1)
-        tmp = tmp.at[-1].set(0)
-        return tmp, tm
-
-    if mask_type in ("both", "y"):
-        start = mask
-    else:
-        start = jnp.ones_like(mask)
-    mask_s = lax.scan(fm, start, length=H + 1)[1]
-    mask_s = mask_s.swapaxes(0, 1)
-    if mask_type in ("both", "x"):
-        mask_s = mask_s * mask[:, np.newaxis]
-
-    return Ys, mask_s
+from smoothlp.utils import bspline, demean, invert, build_stacked, partial_out
 
 
 @dataclass
@@ -126,8 +96,12 @@ class SmoothLocalProjection(AbstractLocalProjection):
         engine_fn = jax.jit(partial(SmoothLocalProjection._fit, **params))
 
         s = datetime.now()
+        # Demeaning uses omission masks; stacked estimation uses inclusion weights.
+        inclusion_mask = (
+            None if self.mask is None else jnp.logical_not(self.mask).astype(float)
+        )
         res = jax.block_until_ready(
-            engine_fn(self.B, self.endog, self.shock, self.exog, self.mask)
+            engine_fn(self.B, self.endog, self.shock, self.exog, inclusion_mask)
         )
         shock, Y, P, mask, u, theta_hat, vcov_nw, lam, tune_trace = (
             np.array(r) for r in res
@@ -167,40 +141,16 @@ class SmoothLocalProjection(AbstractLocalProjection):
         n_shocks = shock.shape[1]
         n_splines = B.shape[1]
 
-        Xs = exog
         if mask is None:
             mask = jnp.ones(T)
-        Ys, mask_s = build_stacked(endog, mask, H, "both")
+        Ys, mask_s = build_stacked("jax", endog, mask, H, "both")
         N = jnp.sum(mask_s)
 
         # Partial out the exogenous variables
-        XpX_partial = jnp.einsum("ti,tj,th->ijh", Xs, Xs, mask_s)
-        XpX_partial_inv = jax.vmap(invert_jax, in_axes=-1, out_axes=-1)(XpX_partial)
-
-        Ys_partial: Float[Array, "T H+1"] = jnp.einsum(
-            "tj,jkh,qk,qh, qh->th",
-            Xs,
-            XpX_partial_inv,
-            Xs,
-            mask_s,
-            Ys,
-            optimize="greedy",
+        Ys_r_m, shock_r_m, _ = partial_out(
+            "jax", Ys, shock, exog, mask_s, leverage=False
         )
-        Ys_r = Ys - Ys_partial
-        Ys_r_m = Ys_r * mask_s
         Y_r_m = Ys_r_m.reshape(T * (H + 1))
-
-        shock_partial: Float[Array, "T H+1"] = jnp.einsum(
-            "tj,jkh,qk,qh,qs->tsh",
-            Xs,
-            XpX_partial_inv,
-            Xs,
-            mask_s,
-            shock,
-            optimize="greedy",
-        )
-        shock_r = shock[..., jnp.newaxis] - shock_partial
-        shock_r_m = shock_r * mask_s[:, jnp.newaxis, :]
 
         # Set up the main matrix
         q = n_shocks * n_splines
@@ -238,12 +188,12 @@ class SmoothLocalProjection(AbstractLocalProjection):
             tune_trace = None
 
         XpX_lam = XpX + lam * P
-        XpX_lam_inv = invert_jax(XpX_lam)
+        XpX_lam_inv = invert("jax", XpX_lam)
         t_Xpy = jnp.einsum("tsh, hk, th -> sk", shock_r_m, B, Ys_r_m).flatten()
         theta_hat = XpX_lam_inv @ t_Xpy
         theta_hat_s = theta_hat.reshape(n_shocks, n_splines)
         ys_hat = jnp.einsum("tsh, hk, sk -> th", shock_r_m, B, theta_hat_s)
-        u = Ys_r - ys_hat
+        u = Ys_r_m - ys_hat
 
         # Compute the covariance matrix for the splines.
         # I first accumulate the weighted Xu values,
@@ -271,7 +221,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         lrv = cross + cross.T
 
         XpX_small_P = XpX + 0.1 * lam * P
-        XpX_inv = invert_jax(XpX_small_P)
+        XpX_inv = invert("jax", XpX_small_P)
         vcov_nw = XpX_inv @ lrv @ XpX_inv
 
         return shock_r_m, Ys, P, mask_s, u, theta_hat, vcov_nw, lam, tune_trace
