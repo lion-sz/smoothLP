@@ -1,6 +1,7 @@
 import numpy as np
 from scipy import linalg as sla
-from jax import numpy as jnp, scipy as jsp
+from jax import numpy as jnp, scipy as jsp, Array, lax
+from jaxtyping import Float
 
 
 def bspline(p, knots, x):
@@ -109,6 +110,49 @@ def demean(
 
     print(f"Exited demeaning after {iter} iterations with norm {iter_norm}.")
     return data
+
+
+def _lrv_np(Xu: Float[np.ndarray, "T k"], lags: int) -> Float[np.ndarray, "k k"]:
+    cross = 0.5 * Xu
+    temp = Xu.copy()
+    for j in range(1, lags + 1):
+        w = 1 - j / (lags + 1)
+        temp = np.roll(temp, -1, axis=0)
+        temp[-1, :] = 0.0
+        cross += w * temp
+    cross = Xu.T @ cross
+    lrv = cross + cross.T
+    return lrv
+
+
+def _lrv_jax(Xu: Float[Array, "T k"], lags: int) -> Float[Array, "k k"]:
+    def accumulate(carry, lag):
+        shifted, weighted = carry
+
+        # Advance one time step, zero-padding instead of wrapping.
+        shifted = jnp.roll(shifted, -1, axis=0).at[-1].set(0.0)
+        weight = 1.0 - lag / (lags + 1)
+        return (shifted, weighted + weight * shifted), None
+
+    (_, weighted), _ = lax.scan(
+        accumulate,
+        (Xu, 0.5 * Xu),
+        jnp.arange(1, lags + 1),
+    )
+
+    cross = Xu.T @ weighted
+    lrv = cross + cross.T
+    return lrv
+
+
+def comp_lrv(Xu, lags: int):
+    if isinstance(Xu, np.ndarray):
+        lrv = _lrv_np(Xu, lags)
+    elif isinstance(Xu, jnp.ndarray):
+        lrv = _lrv_jax(Xu, lags)
+    else:
+        raise ValueError("Xu must be a numpy or jax array")
+    return lrv
 
 
 def np_vmap(f, in_axes=0, out_axes=0):

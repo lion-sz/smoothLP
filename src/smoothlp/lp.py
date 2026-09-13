@@ -8,6 +8,7 @@ from jax import numpy as jnp
 from scipy import linalg as sla
 from statsmodels import api as sm
 
+from smoothlp.utils import comp_lrv
 from smoothlp.models import AbstractLocalProjection, AbstractLocalProjectionResult
 
 
@@ -148,15 +149,7 @@ class LocalProjection(AbstractLocalProjection):
         T, k = X.shape
 
         Xu = X * resid[:, np.newaxis]
-        # First estimate the long run variance
-        lrv = np.zeros((k, k))
-        for j in range(lags + 1):
-            temp = Xu[j:, :].transpose() @ Xu[: (T - j), :]
-            w = 1 - j / (lags + 1)
-            if j == 0:
-                lrv += temp
-            else:
-                lrv += w * (temp + temp.transpose())
+        lrv = comp_lrv(Xu, lags)
         vcov = XpX_inv @ lrv @ XpX_inv
         vcov = (T / (T - k)) * vcov
         return vcov
@@ -224,27 +217,10 @@ class LocalProjection(AbstractLocalProjection):
     @staticmethod
     @jax.jit
     def _lrv_jax(X, resid):
-        T, k = X.shape
         H = resid.shape[0] - 1
-
-        @partial(jax.vmap, in_axes=(0, None))
-        def inner(resid, h):
-            Xu = X * resid.reshape((T, 1))
-            Xu_filled = jnp.concat([np.zeros((H + 1, k)), Xu])
-            gamma = Xu.T @ lax.dynamic_slice_in_dim(Xu_filled, H + 1 - h, T)
-            return gamma + gamma.T * (h > 0)
-
-        _, gammas = lax.scan(
-            lambda c, h: (None, inner(resid, h)), None, np.arange(H + 2)
-        )
-
-        hs = jnp.arange(H + 1)
-        ls = jnp.arange(H + 2)
-        r = jnp.meshgrid(ls, hs, indexing="ij")
-        f = jax.vmap(lambda lag, h: jnp.maximum(0, 1 - lag / (h + 2)))
-        w = f(*r).reshape((H + 2, H + 1, 1, 1))
-        lrv = jnp.sum(gammas * w, axis=0)
-        return lrv
+        # comp_lrv's scan length must be static, so trace each horizon separately.
+        # Residuals already zero out observations beyond each horizon's sample.
+        return jnp.stack([comp_lrv(X * resid[h, :, None], h + 1) for h in range(H + 1)])
 
     @staticmethod
     def _estimation_sm(

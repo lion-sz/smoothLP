@@ -46,3 +46,4 @@ simulator = {workspace = true}
 
 [tool.ruff.lint.per-file-ignores]
 "src/smoothlp/slp.py" = ["F722"]
+"src/smoothlp/utils.py" = ["F722"]

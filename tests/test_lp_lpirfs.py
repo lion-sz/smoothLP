@@ -7,6 +7,68 @@ from numpy import testing as npt
 from smoothlp.lp import LocalProjection
 
 
+@pytest.fixture(scope="module", params=[0, 4], ids=["intercept", "four_lags"])
+def two_shock_data(request):
+    rng = np.random.default_rng(812)
+    n_obs, n_lags = 240, request.param
+    shocks = rng.standard_normal((n_obs + n_lags, 2))
+    noise = rng.standard_normal(n_obs + n_lags)
+    y = np.zeros(n_obs + n_lags)
+    for t in range(1, len(y)):
+        y[t] = 0.6 * y[t - 1] + shocks[t, 0] - 0.4 * shocks[t, 1] + noise[t]
+    controls = np.column_stack(
+        [np.ones(n_obs)]
+        + [y[n_lags - lag : len(y) - lag] for lag in range(1, n_lags + 1)]
+    )
+    return y[n_lags:], shocks[n_lags:], controls
+
+
+def assert_lp_results_equal(actual, expected):
+    npt.assert_allclose(actual.coef, expected.coef, rtol=1e-7, atol=1e-10)
+    npt.assert_allclose(actual.vcov, expected.vcov, rtol=1e-7, atol=1e-10)
+    assert actual.irf.shape == expected.irf.shape == (13, 2)
+    assert actual.se.shape == expected.se.shape == (13, 2)
+    npt.assert_allclose(actual.irf, expected.irf, rtol=1e-7, atol=1e-10)
+    npt.assert_allclose(actual.se, expected.se, rtol=1e-7, atol=1e-10)
+
+
+@pytest.mark.parametrize("vcov", ["non-robust", "HC1", "HC3", "HAC"])
+def test_two_shocks_engines(two_shock_data, vcov):
+    y, shocks, controls = two_shock_data
+    model = LocalProjection(y, shocks, controls, H=12)
+    result_np = model.fit(vcov=vcov, engine="np")
+    assert_lp_results_equal(model.fit(vcov=vcov, engine="jax"), result_np)
+    # The statsmodels engine currently exposes only robust estimators.
+    if vcov != "non-robust":
+        assert_lp_results_equal(model.fit(vcov=vcov, engine="sm"), result_np)
+
+
+@pytest.mark.parametrize("vcov", ["HC1", "HC3", "HAC"])
+@pytest.mark.parametrize("mask_type", ["x", "y", "both"])
+def test_two_shocks_masked_engines(two_shock_data, vcov, mask_type):
+    y, shocks, controls = two_shock_data
+    mask = np.zeros(len(y), dtype=bool)
+    # Exercise isolated, adjacent, and sample-boundary exclusions.
+    mask[[0, 1, 35, 36, 93, len(y) - 2, len(y) - 1]] = True
+    original_mask = mask.copy()
+    model = LocalProjection(y, shocks, controls, H=12, mask=mask, mask_type=mask_type)
+    result_np = model.fit(vcov=vcov, engine="np")
+    npt.assert_array_equal(mask, original_mask)
+    result_sm = model.fit(vcov=vcov, engine="sm")
+    npt.assert_array_equal(mask, original_mask)
+    assert_lp_results_equal(result_np, result_sm)
+
+
+@pytest.mark.parametrize("mask_type", ["x", "y", "both"])
+def test_two_shocks_jax_rejects_mask(two_shock_data, mask_type):
+    y, shocks, controls = two_shock_data
+    mask = np.zeros(len(y), dtype=bool)
+    mask[35] = True
+    model = LocalProjection(y, shocks, controls, H=12, mask=mask, mask_type=mask_type)
+    with pytest.raises(AssertionError, match="Mask is not yet supported"):
+        model.fit(engine="jax")
+
+
 @pytest.fixture(scope="module")
 def interest_data_no_controls():
     p = pathlib.Path(__file__).parent
