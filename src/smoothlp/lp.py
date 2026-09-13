@@ -7,6 +7,7 @@ import numpy as np
 from jax import numpy as jnp, Array
 from statsmodels import api as sm
 from jaxtyping import Float
+import opt_einsum as oe
 
 from smoothlp.utils import comp_lrv, build_stacked, partial_out, invert
 from smoothlp.models import AbstractLocalProjection, AbstractLocalProjectionResult
@@ -127,11 +128,11 @@ class LocalProjection(AbstractLocalProjection):
         )
 
         # Main estimation
-        XpX = lib.einsum("tih,tjh -> ijh", shock_r_m, shock_r_m)
+        XpX = oe.contract("tih,tjh -> ijh", shock_r_m, shock_r_m)
         XpX_inv = invert(engine, XpX, in_axes=2)
         # XpX_inv = jax.vmap(partial(invert, engine), in_axes=2, out_axes=2)(XpX)
-        beta = lib.einsum("ijh, tih, th -> jh", XpX_inv, shock_r_m, Ys_r_m)
-        yhat = lib.einsum("tih, ih -> th", shock_r_m, beta)
+        beta = oe.contract("ijh, tih, th -> jh", XpX_inv, shock_r_m, Ys_r_m)
+        yhat = oe.contract("tih, ih -> th", shock_r_m, beta)
         resid = Ys_r_m - yhat
 
         # Compute the standard errors
@@ -142,7 +143,7 @@ class LocalProjection(AbstractLocalProjection):
             vcov = sig_sqr * XpX_inv
         elif vcov_type == "HC1":
             resid_sqr = lib.square(resid)
-            inner = lib.einsum(
+            inner = oe.contract(
                 "ikh, tkh, th, tlh, ljh -> ijh",
                 XpX_inv,
                 shock_r_m,
@@ -152,13 +153,13 @@ class LocalProjection(AbstractLocalProjection):
             )
             vcov = scale * inner
         elif vcov_type == "HC3":
-            sl = lib.einsum("tih, ijh, tjh -> th", shock_r_m, XpX_inv, shock_r_m)
+            sl = oe.contract("tih, ijh, tjh -> th", shock_r_m, XpX_inv, shock_r_m)
             if exog_leverage is not None:
                 ktt = sl + exog_leverage
             else:
                 ktt = sl
             u_star = lib.square(resid / (1 - ktt))
-            vcov = lib.einsum(
+            vcov = oe.contract(
                 "ikh, tkh, th, tlh, jlh -> ijh",
                 XpX_inv,
                 shock_r_m,
@@ -171,7 +172,7 @@ class LocalProjection(AbstractLocalProjection):
             lrv = lib.stack(
                 [comp_lrv(Xu[:, :, h], h + 1) for h in range(H + 1)], axis=2
             )
-            vcov = lib.einsum("ikh, klh, ljh -> ijh", XpX_inv, lrv, XpX_inv) * scale
+            vcov = oe.contract("ikh, klh, ljh -> ijh", XpX_inv, lrv, XpX_inv) * scale
         return beta.T, lib.moveaxis(vcov, -1, 0) if vcov is not None else None
 
     @staticmethod
