@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from functools import cached_property, partial
 from datetime import datetime
+from numbers import Real
+from typing import Literal
 
 import jax
 import numpy as np
@@ -74,12 +76,22 @@ class SmoothLocalProjection(AbstractLocalProjection):
 
     def fit(
         self,
-        lam: float | None,
+        lam: float | Literal["cv", "gcv"] = "gcv",
         lam_grid_lower: float = -3.0,
-        lam_grid_upper: float = 4.0,
+        lam_grid_upper: float = 1.0,
         lam_grid_size: int = 1_000,
     ):
         # First create the splines. Indexed by horizon x basis function
+
+        if isinstance(lam, Real):
+            lam_selection = None
+            lam = float(lam)
+        elif lam in (None, "gcv", "cv"):
+            # Keep None as the backwards-compatible spelling of GCV selection.
+            lam_selection = "gcv" if lam is None else lam
+            lam = None
+        else:
+            raise ValueError("lam must be a real number, None, 'gcv', or 'cv'")
 
         if len(self.fe) > 0:
             res = demean(self.fe, [self.endog, self.shock, self.exog], mask=self.mask)
@@ -88,12 +100,12 @@ class SmoothLocalProjection(AbstractLocalProjection):
         params = {
             "H": self.H,
             "n_diff": self.n_diff,
+            "lam_selection": lam_selection,
             "lam": lam,
             "lam_grid_lower": lam_grid_lower,
             "lam_grid_upper": lam_grid_upper,
             "lam_grid_size": lam_grid_size,
         }
-        engine_fn = jax.jit(partial(SmoothLocalProjection._fit, **params))
 
         s = datetime.now()
         # Demeaning uses omission masks; stacked estimation uses inclusion weights.
@@ -101,7 +113,9 @@ class SmoothLocalProjection(AbstractLocalProjection):
             None if self.mask is None else jnp.logical_not(self.mask).astype(float)
         )
         res = jax.block_until_ready(
-            engine_fn(self.B, self.endog, self.shock, self.exog, inclusion_mask)
+            SmoothLocalProjection._fit(
+                self.B, self.endog, self.shock, self.exog, inclusion_mask, **params
+            )
         )
         shock, Y, P, mask, u, theta_hat, vcov_nw, lam, tune_trace = (
             np.array(r) for r in res
@@ -123,6 +137,10 @@ class SmoothLocalProjection(AbstractLocalProjection):
         )
 
     @staticmethod
+    @partial(
+        jax.jit,
+        static_argnames=("H", "n_diff", "lam_selection", "lam_grid_size"),
+    )
     def _fit(
         B: Float[Array, "{H}+1 b"],
         endog: Float[Array, " T"],
@@ -131,7 +149,8 @@ class SmoothLocalProjection(AbstractLocalProjection):
         mask: Float[Array, " T"] | None,
         H: int,
         n_diff: int,
-        lam: float | None,
+        lam_selection: None | Literal["cv", "gcv"],
+        lam: None | float,
         lam_grid_lower: float,
         lam_grid_upper: float,
         lam_grid_size: int,
@@ -169,21 +188,27 @@ class SmoothLocalProjection(AbstractLocalProjection):
                 (i * n_splines) : (i + 1) * n_splines,
                 (i * n_splines) : (i + 1) * n_splines,
             ].set(temp)
-        if lam is None:
-            Xpy = jnp.einsum("tsh, th, hk -> sk", shock_r_m, Ys_r_m, B).reshape(q)
-            ypy = jnp.sum(jnp.square(Y_r_m))
-            n_fitted = k * (H + 1)
-            lam, tune_trace = SmoothLocalProjection._tune_lambda(
-                XpX,
-                Xpy,
-                ypy,
-                P,
-                N,
-                lam_grid_lower,
-                lam_grid_upper,
-                lam_grid_size,
-                n_fitted,
+        if lam_selection is not None:
+            lam_grid = N * jnp.pow(
+                10, jnp.linspace(lam_grid_lower, lam_grid_upper, lam_grid_size)
             )
+            if lam_selection == "gcv":
+                Xpy = jnp.einsum("tsh, th, hk -> sk", shock_r_m, Ys_r_m, B).reshape(q)
+                ypy = jnp.sum(jnp.square(Y_r_m))
+                n_fitted = k * (H + 1)
+                lam, tune_trace = SmoothLocalProjection._tune_lambda(
+                    lam_grid,
+                    XpX,
+                    Xpy,
+                    ypy,
+                    P,
+                    N,
+                    n_fitted,
+                )
+            elif lam_selection == "cv":
+                lam, tune_trace = SmoothLocalProjection._tune_lambda_cv(
+                    lam_grid, B, P, Ys, shock, exog, mask_s, 5
+                )
         else:
             tune_trace = None
 
@@ -228,14 +253,12 @@ class SmoothLocalProjection(AbstractLocalProjection):
 
     @staticmethod
     def _tune_lambda(
+        lam_grid,
         XpX,
         Xpy,
         ypy,
         P,
         n: int,
-        lam_grid_lower: float,
-        lam_grid_upper: float,
-        lam_grid_size: int,
         n_fitted: int,
     ):
         """Tune lambda using Demmler-Reinsch Orthogonalization
@@ -253,7 +276,6 @@ class SmoothLocalProjection(AbstractLocalProjection):
         RTinv_P_Rinv = Rinv.T @ P @ Rinv
         s, U = jnp.linalg.eigh(RTinv_P_Rinv)
         s = jnp.maximum(s, 0.0)  # P is positive semidefinite
-        jax.debug.print("Condition number: {cond}", cond=jnp.max(s) / jnp.min(s + 1e-9))
         Z = Rinv @ U
         b = Z.T @ Xpy
         ApA = Z.T @ XpX @ Z
@@ -268,16 +290,95 @@ class SmoothLocalProjection(AbstractLocalProjection):
             aic = jnp.log(rss) + 2 * dfit / n
             return jnp.array([rss, gcv, aic, dfit])
 
-        # Build the grid and map the step function over it
-        lam_grid = n * jnp.pow(
-            10, jnp.linspace(lam_grid_lower, lam_grid_upper, lam_grid_size)
-        )
         values = jax.vmap(eval_f)(lam_grid)
-
         argmin_gcv = jnp.argmin(values[:, 1])
         min_gcv = lam_grid[argmin_gcv]
 
         return min_gcv, values
+
+    @staticmethod
+    # @partial(jax.jit, static_argnames=["n_folds"])
+    def _tune_lambda_cv(
+        lam_grid,
+        B: Float[Array, "{H}+1 b"],
+        P: Float[Array, "q q"],
+        Ys: Float[Array, "T {H+1}"],
+        shock: Float[Array, "T {H+1}"],
+        exog: Float[Array, "T k"],
+        mask_s: Float[Array, "T {H+1}"],
+        n_folds: int,
+    ):
+        n_shocks = shock.shape[1]
+        n_splines = B.shape[1]
+        Th = jnp.sum(mask_s, axis=0)
+
+        index = jnp.cumsum(mask_s, axis=0) / (Th[jnp.newaxis, :] / n_folds)
+        index = jnp.floor(index)
+
+        def fold(_, ind: float):
+            """
+            This function uses a slightly tuned version of the Demmler-Reisch orthogonalization.
+            It makes sure that I'm computing the out of sample Rss by slightly adjusting which y
+            is used in the regression.
+            """
+            # Set up the masks
+            m_train = jnp.where(index == ind, 0.0, mask_s)
+            m_test = jnp.where(index != ind, 0.0, mask_s)
+            # Partial out the regressors
+            Ys_r, shock_r, _ = partial_out(
+                "jax",
+                Ys,
+                shock,
+                exog,
+                m_train,
+                leverage=False,
+                unmasked=True,
+            )
+            Ys_train = Ys_r * m_train
+            Ys_test = Ys_r * m_test
+            shock_train = shock_r * m_train[:, jnp.newaxis, :]
+            shock_test = shock_r * m_test[:, jnp.newaxis, :]
+            # Set up the main matrix
+            q = n_shocks * n_splines
+            XpX = jnp.einsum(
+                "tih,tjh,hk,hl->ikjl", shock_train, shock_train, B, B
+            ).reshape(q, q)
+            XpX_test = jnp.einsum(
+                "tih,tjh,hk,hl->ikjl", shock_test, shock_test, B, B
+            ).reshape(q, q)
+            Xpy = jnp.einsum("tsh, hk, th -> sk", shock_train, B, Ys_train).flatten()
+            Xpy_test = jnp.einsum("tsh, hk, th -> sk", shock_test, B, Ys_test).flatten()
+            ypy = jnp.sum(jnp.square(Ys_test))
+
+            # This matrix is rank deficint (more splines than horizons).
+            # To make it well behaved, I add a rather strong penalty to it.
+            # Note, that I need to subtract this later on.
+            penalty_scale = jnp.minimum(jnp.max(jnp.abs(P)), 1.0)
+            reference_lam = jnp.max(jnp.abs(XpX)) / penalty_scale
+            R = jsp.linalg.cholesky(XpX + reference_lam * P, lower=False)
+            Rinv = jsp.linalg.solve_triangular(R, jnp.eye(XpX.shape[0]))
+            RTinv_P_Rinv = Rinv.T @ P @ Rinv
+            s, U = jnp.linalg.eigh(RTinv_P_Rinv)
+            s = jnp.maximum(s, 0.0)  # P is positive semidefinite
+            Z = Rinv @ U
+            b = Z.T @ Xpy
+            b_test = Z.T @ Xpy_test
+            At_T_At = Z.T @ XpX_test @ Z
+
+            def eval_f(lam):
+                d = 1 / (1 + (lam - reference_lam) * s)
+                bd = b * d
+                rss = ypy - 2 * b_test.T @ bd + bd.T @ At_T_At @ bd
+                return rss
+
+            return None, jax.vmap(eval_f)(lam_grid) / jnp.sum(m_test)
+
+        _, mse = lax.scan(fold, None, jnp.arange(n_folds))
+        mse = jnp.mean(mse, axis=0)
+
+        lam_min = lam_grid[jnp.argmin(mse)]
+
+        return lam_min, mse
 
 
 @dataclass

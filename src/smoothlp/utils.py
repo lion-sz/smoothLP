@@ -251,6 +251,7 @@ def _partial_out_jax(
     exog: Float[Array, "T k"],
     mask_s: Float[Array, "T H+1"],
     leverage: bool,
+    unmasked: bool = False,
 ):
     # Partial out the regressors
     XpX = jnp.einsum("ti,tj,th->ijh", exog, exog, mask_s)
@@ -270,7 +271,6 @@ def _partial_out_jax(
         optimize="greedy",
     )
     Ys_r = Ys - Ys_partial
-    Ys_r_m = Ys_r * mask_s
 
     shock_partial: Float[Array, "T H+1"] = jnp.einsum(
         "tj,jkh,qk,qh,qs->tsh",
@@ -282,9 +282,12 @@ def _partial_out_jax(
         optimize="greedy",
     )
     shock_r = shock[..., jnp.newaxis] - shock_partial
-    shock_r_m = shock_r * mask_s[:, jnp.newaxis, :]
 
-    return Ys_r_m, shock_r_m, X_leverage
+    if not unmasked:
+        Ys_r = Ys_r * mask_s
+        shock_r = shock_r * mask_s[:, jnp.newaxis, :]
+
+    return Ys_r, shock_r, X_leverage
 
 
 def _partial_out_np(
@@ -336,9 +339,18 @@ def _partial_out_np(
     return Ys_r_m, shock_r_m, X_leverage
 
 
-def partial_out(engine: Literal["jax", "np"], Ys, shock, exog, mask_s, leverage: bool):
+def partial_out(
+    engine: Literal["jax", "np"],
+    Ys,
+    shock,
+    exog,
+    mask_s,
+    leverage: bool,
+    unmasked: bool = False,
+):
     """Partial out controls using binary inclusion masks (1 keeps, 0 omits)."""
     if exog is None and engine in ("jax", "np"):
+        assert unmasked is False, "Unmasked without exog not yet supported."
         lib = jnp if engine == "jax" else np
         return (
             Ys * mask_s,
@@ -346,7 +358,7 @@ def partial_out(engine: Literal["jax", "np"], Ys, shock, exog, mask_s, leverage:
             lib.zeros_like(mask_s) if leverage else None,
         )
     if engine == "jax":
-        return _partial_out_jax(Ys, shock, exog, mask_s, leverage)
+        return _partial_out_jax(Ys, shock, exog, mask_s, leverage, unmasked)
     elif engine == "np":
         return _partial_out_np(Ys, shock, exog, mask_s, leverage)
     else:

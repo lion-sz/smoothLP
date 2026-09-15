@@ -21,7 +21,7 @@ def test_gcv_matches_full_design(H, n_shocks):
     shocks = rng.normal(size=(T, n_shocks)) + controls[:, 1:2]
     y = 0.7 * shocks[:, 0] + controls @ np.array([1.0, 0.4]) + rng.normal(size=T)
     model = SmoothLocalProjection(y, shocks, controls, H, target_poly_order=1)
-    result = model.fit(None, lam_grid_size=31)
+    result = model.fit("gcv", lam_grid_size=31)
 
     # Construct explicit horizon-specific controls, without Python's partialling
     # out or orthogonalization. Each shock has a consecutive spline block.
@@ -44,7 +44,7 @@ def test_gcv_matches_full_design(H, n_shocks):
     D = np.diff(np.eye(model.B.shape[1]), n=2, axis=0)
     P[:n_spline_coef, :n_spline_coef] = np.kron(np.eye(n_shocks), D.T @ D)
     XX, XY = X.T @ X, X.T @ Y
-    grid = len(Y) * 10 ** np.linspace(-3, 4, 31)
+    grid = len(Y) * 10 ** np.linspace(-3, 1, 31)
     trace, coefs = [], []
     for penalty in grid:
         A = XX + penalty * P
