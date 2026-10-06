@@ -59,7 +59,8 @@ def test_gcv_matches_full_design(H, n_shocks):
     selected = np.argmin(trace[:, 1])
     assert_allclose(result.tune_trace, trace, rtol=1e-6, atol=1e-6)
     assert_allclose(result.lam, grid[selected], rtol=1e-12)
-    assert_allclose(result.coef, coefs[selected], rtol=1e-6, atol=1e-7)
+    expected_coef = coefs[selected].reshape(n_shocks, model.B.shape[1]).T
+    assert_allclose(result.coef, expected_coef, rtol=1e-6, atol=1e-7)
 
     reference = fit_reference(
         stacked_reference(y, shocks, controls, model.B, model.n_diff), grid[selected]

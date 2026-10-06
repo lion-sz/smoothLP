@@ -7,3 +7,13 @@ scripts
 **/profile_*.txt
 **/profile_output.lprof
 doc/build
+DrechselSUR
+slp_source
+
+# Keep the SLP benchmark while leaving other local scripts ignored.
+!/scripts/
+/scripts/*
+!/scripts/benchmark_slp.py
+
+# Generated Monte Carlo results (the YAML examples overwrite this directory).
+/results/current/

@@ -49,7 +49,8 @@ def stacked_reference(y, shocks, controls, B, n_diff, mask=None):
         if not len(times):
             continue
         W = controls[times]
-        assert np.linalg.matrix_rank(W) == W.shape[1]
+        if W.shape[1]:
+            assert np.linalg.matrix_rank(W) == W.shape[1]
         Q, _ = np.linalg.qr(W, mode="reduced")
         Z = np.array([np.kron(shocks[t], B[h]) for t in times])
         outcome = y[times + h]
@@ -98,8 +99,7 @@ def fit_reference(design, lam):
             for a in range(s)
         ]
     )
-    if s == 1:
-        irf, se = irf[:, 0], se[:, 0]
+    coef = coef.reshape(s, q).T
     return SimpleNamespace(coef=coef, irf=irf, vcov_nw=vcov, se=se, lam=lam)
 
 

@@ -9,7 +9,9 @@ import numpy as np
 from jax import lax, Array
 from jax import numpy as jnp, scipy as jsp
 from jaxtyping import Float
+from jax.numpy import newaxis as nax
 
+from smoothlp._blocked import blocked_cholesky, block_solve
 from smoothlp.models import AbstractLocalProjection
 from smoothlp.utils import bspline, demean, invert, build_stacked, partial_out
 
@@ -49,7 +51,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
             else:
                 self.fe = fe
         self.p = p
-        self.n_diff = target_poly_order + 1
+        self.n_diff = target_poly_order + 1  # Check how other packages handle this!
 
         self.mask_any_prev_h = mask_any_prev_h
 
@@ -80,9 +82,16 @@ class SmoothLocalProjection(AbstractLocalProjection):
         lam_grid_lower: float = -3.0,
         lam_grid_upper: float = 1.0,
         lam_grid_size: int = 1_000,
+        partial_out: bool = True,
     ):
         # First create the splines. Indexed by horizon x basis function
 
+        assert not (not partial_out and lam == "cv"), (
+            "Not partialing out and cv is not yet supported."
+        )
+        assert partial_out or self.p == 3, (
+            "Non-cubic splines not yet supported with no partial out."
+        )
         if isinstance(lam, Real):
             lam_selection = None
             lam = float(lam)
@@ -112,8 +121,9 @@ class SmoothLocalProjection(AbstractLocalProjection):
         inclusion_mask = (
             None if self.mask is None else jnp.logical_not(self.mask).astype(float)
         )
+        fit_function = self._fit if partial_out else self._fit_no_partial_out
         res = jax.block_until_ready(
-            SmoothLocalProjection._fit(
+            fit_function(
                 self.B, self.endog, self.shock, self.exog, inclusion_mask, **params
             )
         )
@@ -135,6 +145,179 @@ class SmoothLocalProjection(AbstractLocalProjection):
             _mask=mask,
             _us=u,
         )
+
+    @staticmethod
+    @partial(
+        jax.jit,
+        static_argnames=("H", "n_diff", "lam_selection", "lam_grid_size"),
+    )
+    def _fit_no_partial_out(
+        B: Float[Array, "{H}+1 b"],
+        endog: Float[Array, " T"],
+        shock: Float[Array, "T s"],
+        exog: Float[Array, "T k"],
+        mask: Float[Array, " T"] | None,
+        H: int,
+        n_diff: int,
+        lam_selection: None | Literal["cv", "gcv"],
+        lam: None | float,
+        lam_grid_lower: float,
+        lam_grid_upper: float,
+        lam_grid_size: int,
+    ):
+        """Fit without partialling out the exogenous variables."""
+        T = endog.shape[0]
+        k = B.shape[1]
+        n_shocks = shock.shape[1]
+        shock = jnp.concat([shock, exog], axis=1)
+        n = shock.shape[1]
+        # First compute the Bh x Bh matrices
+        Bh = jnp.einsum("hi,hj->hij", B, B)
+
+        # Build the penalty matrix
+        q = n * k
+        D = jnp.eye(k)
+        for i in range(n_diff):
+            D = jnp.diff(D, axis=0)
+        # Coefficients are basis-major: (b1*x1, ..., b1*xn, b2*x1, ...).
+        # Therefore every entry of the basis penalty is an n-by-n diagonal
+        # block, preserving the block-banded structure in the basis dimension.
+        basis_penalty = D.T @ D
+        P = jnp.kron(basis_penalty, jnp.eye(n))
+
+        # Slot i stores the block at (column + i, column). The Gram
+        # matrix needs three bands; the penalty needs n_diff + 1.
+        n_bands = max(3, n_diff + 1)
+        Ps = jnp.zeros((k, n_bands, n, n))
+        for i in range(min(n_diff + 1, k)):
+            d = jnp.diag(basis_penalty, k=-i)
+            Ps = Ps.at[: (k - i), i].set(d[:, nax, nax] * jnp.eye(n))
+
+        # Stack the observations and build the mask
+        if mask is None:
+            mask = jnp.ones(T)
+        Ys, mask_s = build_stacked("jax", endog, mask, H, "both")
+        N = jnp.sum(mask_s)
+
+        temp = B[0, :3].reshape((-1, 1)) @ B[0, :3].reshape((1, -1))
+
+        def acc(carry, data):
+            xxT = jnp.einsum("ti,tj,t->ij", shock, shock, data)
+            res = temp[:, 0][:, jnp.newaxis, jnp.newaxis] * xxT[jnp.newaxis, :, :]
+            res = res.at[:2, :, :].add(carry[[0, 1], :, :])
+            carryp = temp[[1, 1, 2], [1, 2, 2]].reshape((3, 1, 1)) * xxT
+            carryp = carryp.at[0, :, :].add(carry[2, :, :])
+            return carryp, res
+
+        final_carry, XTX_stacked = lax.scan(
+            acc, jnp.zeros((3, n, n)), jnp.swapaxes(mask_s, 0, 1)
+        )
+        XTX_stacked = jnp.concat(
+            [
+                XTX_stacked,
+                jnp.concat([final_carry[[0, 1], :, :], jnp.zeros((1, n, n))]).reshape(
+                    (1, 3, n, n)
+                ),
+                jnp.concat([final_carry[[2], :, :], jnp.zeros((2, n, n))]).reshape(
+                    (1, 3, n, n)
+                ),
+            ]
+        )
+        # Higher difference orders widen the penalty, not the spline Gram.
+        XTX_stacked = jnp.pad(XTX_stacked, ((0, 0), (0, n_bands - 3), (0, 0), (0, 0)))
+
+        xxT_h = jnp.einsum("ti,tj,th->hij", shock, shock, mask_s)
+        XTy = jnp.einsum("ti,hk,th->ki", shock, B, mask_s * Ys).reshape((q, 1))
+
+        if lam_selection is not None:
+            ypy = jnp.sum(jnp.square(Ys * mask_s))
+
+            # Here I need to tune lambda
+            reference_lam = 10
+            sl = XTX_stacked + reference_lam * Ps
+
+            L = blocked_cholesky(sl)
+            res = jnp.eye(q).reshape((k, n, q))
+            Linv = block_solve(L, res).reshape((q, q))
+
+            RPR = Linv @ P @ Linv.T
+            s, U = jnp.linalg.eigh(RPR)
+            s = jnp.maximum(s, 0.0)  # P is positive semidefinite
+            # b is UT (R-T CTy), I can compute the right part cheaply
+            RinvT_CT_y = block_solve(L, XTy.reshape((k, n, 1))).reshape((q, 1))
+            b = (U.T @ RinvT_CT_y).flatten()
+            # Apa is a diagonal matrix
+            ApA = jnp.ones_like(s) - reference_lam * s
+
+            def eval_f(lam):
+                d = 1 / (1 + (lam - reference_lam) * s)
+                bd = b * d
+                rss = ypy - 2 * jnp.dot(b, bd) + jnp.dot(bd * ApA, bd)
+                # A is whitened at reference_lam, so A.T @ A is not identity.
+                dfit = jnp.sum(ApA * d)
+                gcv = rss / (1 - dfit / N) ** 2
+                aic = jnp.log(rss) + 2 * dfit / N
+                return jnp.array([rss, gcv, aic, dfit])
+
+            lam_grid = N * jnp.pow(
+                10, jnp.linspace(lam_grid_lower, lam_grid_upper, lam_grid_size)
+            )
+            values = jax.vmap(eval_f)(lam_grid)
+            argmin_gcv = jnp.argmin(values[:, 1])
+            jax.debug.print("Picking lambda position {pos}.", pos=argmin_gcv)
+            min_gcv = lam_grid[argmin_gcv]
+            lam = min_gcv
+
+        # Here I need to tune lambda
+        design = XTX_stacked + lam * Ps
+        L = blocked_cholesky(design)
+        theta = block_solve(L, XTy.reshape((k, n, 1)))
+        theta = block_solve(L, theta, lower=False).reshape((q, 1))
+        theta_s = theta.reshape((k, n))
+
+        # Fit the main model.
+        # design = XTX + lam * P
+        # R = jnp.linalg.cholesky(design, upper=True)
+        # theta = jsp.linalg.solve_triangular(R.T, XTy, lower=True)
+        # theta = jsp.linalg.solve_triangular(R, theta, lower=False).flatten()
+        # theta_s = theta.reshape((k, n))
+        us = (Ys - jnp.einsum("ts,hk,ks->th", shock, B, theta_s)) * mask_s
+        Xu = shock[:, jnp.newaxis, :] * us[:, :, jnp.newaxis]
+
+        # Select shock-major spline blocks for the covariance matrix,
+        # while retaining basis-major ordering internally.
+        shock_indices = (
+            jnp.arange(n_shocks)[:, jnp.newaxis] + n * jnp.arange(k)[jnp.newaxis, :]
+        ).reshape(-1)
+        selector = jnp.eye(q)[shock_indices]
+
+        # Compute W = bread^-1 selector.T.
+        bread_vcov = XTX_stacked + 0.1 * lam * Ps
+        bread_L = blocked_cholesky(bread_vcov)
+        W = block_solve(bread_L, selector.T.reshape((k, n, n_shocks * k)), lower=True)
+        W = block_solve(bread_L, W, lower=False)
+        g = jnp.einsum("tk,ts,ksl->tl", us @ B, shock, W)
+
+        def accumulate(carry, lag):
+            shifted, weighted = carry
+
+            # Advance one time step, zero-padding instead of wrapping.
+            shifted = jnp.roll(shifted, -1, axis=0).at[-1].set(0.0)
+            weight = 1.0 - lag / (H + 1)
+            return (shifted, weighted + weight * shifted), None
+
+        (_, weighted), _ = lax.scan(
+            accumulate,
+            (g, 0.5 * g),
+            jnp.arange(1, H + 1),
+        )
+
+        cross = g.T @ weighted
+        lrv = cross + cross.T
+        lrv
+        coef = theta[shock_indices].reshape((n_shocks, k)).T
+
+        return None, Ys, P, mask_s, us, coef, lrv, lam, None
 
     @staticmethod
     @partial(
@@ -249,7 +432,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         XpX_inv = invert("jax", XpX_small_P)
         vcov_nw = XpX_inv @ lrv @ XpX_inv
 
-        return shock_r_m, Ys, P, mask_s, u, theta_hat, vcov_nw, lam, tune_trace
+        return shock_r_m, Ys, P, mask_s, u, theta_hat_s.T, vcov_nw, lam, tune_trace
 
     @staticmethod
     def _tune_lambda(
@@ -383,6 +566,12 @@ class SmoothLocalProjection(AbstractLocalProjection):
 
 @dataclass
 class SmoothLocalProjectionResult:
+    """SLP results with shock columns.
+
+    Coefficients have shape (n_splines, n_shocks); IRFs and standard errors
+    have shape (H + 1, n_shocks). Covariance uses shock-major spline blocks.
+    """
+
     model: SmoothLocalProjection
     knots: np.ndarray
     P: np.ndarray
@@ -408,19 +597,7 @@ class SmoothLocalProjectionResult:
 
     @cached_property
     def irf(self):
-        B = self.model.B
-        n_splines = B.shape[1]
-        n_shocks = self.model.shock.shape[1]
-        irfs = [
-            (
-                B @ self.coef[i * n_splines : (i + 1) * n_splines].reshape((-1, 1))
-            ).flatten()
-            for i in range(n_shocks)
-        ]
-        irf = np.stack(irfs, axis=1)
-        if n_shocks == 1:
-            irf = irf.squeeze()
-        return irf
+        return self.B @ self.coef
 
     @cached_property
     def se(self):
@@ -436,7 +613,4 @@ class SmoothLocalProjectionResult:
                     lib.diag(B @ self.vcov_nw[shock_slice, shock_slice] @ B.transpose())
                 )
             )
-        se = np.stack(ses, axis=1)
-        if n_shocks == 1:
-            se = se.squeeze(axis=1)
-        return se
+        return np.stack(ses, axis=1)
