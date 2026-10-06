@@ -14,7 +14,11 @@ from numpy.testing import assert_allclose
 
 def simulated_data(T=320, n_shocks=2, n_controls=3, seed=812, masked=False):
     rng = np.random.default_rng(seed)
-    controls = np.column_stack((np.ones(T), rng.normal(size=(T, n_controls - 1))))
+    controls = (
+        np.column_stack((np.ones(T), rng.normal(size=(T, n_controls - 1))))
+        if n_controls
+        else np.empty((T, 0))
+    )
     common = rng.normal(size=(T, 1))
     shocks = rng.normal(size=(T, n_shocks)) + 0.65 * common
     shocks += controls @ rng.normal(scale=0.4, size=(n_controls, n_shocks))
@@ -38,6 +42,8 @@ def simulated_data(T=320, n_shocks=2, n_controls=3, seed=812, masked=False):
 def stacked_reference(y, shocks, controls, B, n_diff, mask=None):
     """Invalid rows stay zero at their original times, including internal gaps."""
     T, s = shocks.shape
+    if controls is None:
+        controls = np.empty((T, 0))
     horizons, q = B.shape
     mask = np.ones(T, dtype=bool) if mask is None else ~np.asarray(mask, dtype=bool)
     X = np.zeros((T, horizons, s * q))
