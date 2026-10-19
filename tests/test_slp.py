@@ -115,7 +115,8 @@ def _full_design_gcv_reference(y, shocks, controls, B, n_diff, mask):
     P = np.zeros((X.shape[1], X.shape[1]))
     P[:n_spline_coef, :n_spline_coef] = np.kron(np.eye(n_shocks), D.T @ D)
     XX, XY = X.T @ X, X.T @ Y
-    grid = len(Y) * 10 ** np.linspace(-3, 1, GRID_SIZE)
+    # Effective version of production's default grid 10**linspace(-3, 3, size).
+    grid = len(Y) * 10 ** np.linspace(-3, 3, GRID_SIZE)
     trace, coefs = [], []
     for lam in grid:
         A = XX + lam * P
@@ -134,7 +135,7 @@ def _full_design_gcv_reference(y, shocks, controls, B, n_diff, mask):
     bread = np.linalg.solve(XX + 0.1 * lam * P, np.eye(X.shape[1]))
     covariance = bread @ hac_meat(scores, horizons - 1) @ bread.T
     return SimpleNamespace(
-        lam=lam,
+        lam=lam / len(Y),  # effective grid penalty -> R units (production reports lam)
         tune_trace=trace,
         coef=coef[:n_spline_coef].reshape(n_shocks, n_splines).T,
         vcov_nw=covariance[:n_spline_coef, :n_spline_coef],
@@ -217,7 +218,7 @@ def test_joint_matches_promoted_shocks(
     assert_estimate_matches(joint, _select_shocks(promoted, n_shocks))
     assert_allclose(joint.lam, promoted.lam, rtol=1e-12, atol=0)
     # These fits have the same complete penalized design and residuals.
-    for name in ("P", "_mask", "_Ys", "_us"):
+    for name in ("_mask", "_Ys", "_us"):
         actual, expected = (
             np.asarray(getattr(joint, name)),
             np.asarray(getattr(promoted, name)),
@@ -267,7 +268,8 @@ def _full_design_cv_reference(y, shocks, controls, B, n_diff, mask):
     D = np.diff(np.eye(n_splines), n=n_diff, axis=0)
     P = np.zeros((X.shape[1], X.shape[1]))
     P[:n_spline_coef, :n_spline_coef] = np.kron(np.eye(n_shocks), D.T @ D)
-    grid = len(Y) * 10 ** np.linspace(-3, 1, GRID_SIZE)
+    # Effective version of production's default grid 10**linspace(-3, 3, size).
+    grid = len(Y) * 10 ** np.linspace(-3, 3, GRID_SIZE)
     fold_mse = []
     held_out_count = np.zeros(len(Y), dtype=int)
     for fold in range(5):
@@ -279,13 +281,14 @@ def _full_design_cv_reference(y, shocks, controls, B, n_diff, mask):
         XX, XY = X_train.T @ X_train, X_train.T @ Y_train
         errors = []
         for lam in grid:
-            coef = np.linalg.solve(XX + lam * P, XY)
+            coef = np.linalg.solve(XX + 0.8 * lam * P, XY)
             errors.append(np.mean((Y[test] - X[test] @ coef) ** 2))
         fold_mse.append(errors)
     assert np.all(held_out_count == 1)
     # Match the estimator's convention: equal weight per fold, not per row.
     trace = np.mean(fold_mse, axis=0)
-    return SimpleNamespace(lam=grid[np.argmin(trace)], tune_trace=trace)
+    # Convert the effective grid penalty to R units (production reports lam).
+    return SimpleNamespace(lam=grid[np.argmin(trace)] / len(Y), tune_trace=trace)
 
 
 @pytest.mark.parametrize("H", [4])

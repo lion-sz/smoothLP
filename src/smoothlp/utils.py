@@ -1,7 +1,6 @@
 from typing import Literal
 
 import numpy as np
-from scipy import linalg as sla
 import jax
 from jax import numpy as jnp, scipy as jsp, Array, lax
 from jaxtyping import Float
@@ -366,6 +365,8 @@ def partial_out(
 
 
 def _invert_np(X):
+    from scipy import linalg as sla
+
     U = sla.cholesky(X)
     U_inv = sla.solve_triangular(U, np.eye(X.shape[0]))
     return U_inv @ U_inv.T

@@ -4,6 +4,9 @@ Do not reuse production stacking, residualization, penalty, tuning, or covarianc
 helpers. The supplied public B is shared: these tests target estimation rather
 than spline construction. Binary masks exclude any interval containing an
 omitted observation, including its endpoints.
+
+`lam` follows the production (and original R) convention: the penalty entering
+the normal equations is `lam * n * P`, where `n` is the stacked sample size.
 """
 
 from types import SimpleNamespace
@@ -88,14 +91,16 @@ def hac_meat(scores, H):
 
 
 def fit_reference(design, lam):
+    """Fit at `lam` in R units: the penalty is `lam * n * P` (n stacked rows)."""
     X, Y, B, P = design.X, design.Y, design.B, design.P
-    coef = np.linalg.solve(design.gram + lam * P, design.rhs)
+    lam_eff = lam * design.n
+    coef = np.linalg.solve(design.gram + lam_eff * P, design.rhs)
     errors = Y - (X @ coef)
     # Aggregate horizons within original time BEFORE calculating HAC lags.
     scores = np.sum(X * errors[..., None], axis=1)
     meat = hac_meat(scores, B.shape[0] - 1)
     # Preserve SLP's inference convention, distinct from fitting lambda.
-    bread = np.linalg.solve(design.gram + 0.1 * lam * P, np.eye(len(coef)))
+    bread = np.linalg.solve(design.gram + 0.1 * lam_eff * P, np.eye(len(coef)))
     vcov = bread @ meat @ bread.T
     s, q = len(coef) // B.shape[1], B.shape[1]
     irf = np.column_stack([B @ coef[a * q : (a + 1) * q] for a in range(s)])

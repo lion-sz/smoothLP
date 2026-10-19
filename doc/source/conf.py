@@ -30,3 +30,23 @@ autoclass_content = "both"
 
 html_theme = "sphinx_rtd_theme"
 html_static_path = ["_static"]
+
+
+# -- Options for the standalone algorithm PDF -------------------------------
+
+# Keep the HTML documentation rooted at index.rst, while using the detailed
+# SLP algorithm page as the root of a short, independently shareable PDF.
+latex_documents = [
+    (
+        "slp_algorithm",
+        "smoothlp-slp-algorithm.tex",
+        "SmoothLP: Smooth Local Projections",
+        author,
+        "howto",
+    ),
+]
+
+latex_elements = {
+    "papersize": "a4paper",
+    "pointsize": "11pt",
+}

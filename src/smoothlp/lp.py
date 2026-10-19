@@ -5,7 +5,6 @@ from typing import Literal
 import jax
 import numpy as np
 from jax import numpy as jnp, Array
-from statsmodels import api as sm
 from jaxtyping import Float
 import opt_einsum as oe
 
@@ -186,6 +185,9 @@ class LocalProjection(AbstractLocalProjection):
         mask: np.ndarray | None,
         mask_type: str = "both",
     ):
+        from statsmodels.regression.linear_model import OLS
+        from statsmodels.stats.sandwich_covariance import cov_hac
+
         mask = None if mask is None else mask == 1.0
         assert vcov_type in ("HC1", "HC3", "HAC")
         if exog is not None:
@@ -216,16 +218,14 @@ class LocalProjection(AbstractLocalProjection):
                     tx = tx[mask[: (T - h)]]
                     ty = ty[mask[: (T - h)]]
 
-            tmod = sm.OLS(ty, tx).fit(
-                cov_type=vcov_type if vcov_type != "HAC" else "HC0"
-            )
+            tmod = OLS(ty, tx).fit(cov_type=vcov_type if vcov_type != "HAC" else "HC0")
             coef[h, :] = tmod.params
             if vcov_type == "HC1":
                 vcov[h, :, :] = tmod.cov_HC1
             elif vcov_type == "HC3":
                 vcov[h, :, :] = tmod.cov_HC3
             else:
-                vcov[h, :, :] = sm.stats.cov_hac(tmod, nlags=h + 1)
+                vcov[h, :, :] = cov_hac(tmod, nlags=h + 1)
 
         n_shocks = shock.shape[1]
         return coef[:, :n_shocks], vcov[:, :n_shocks, :n_shocks]

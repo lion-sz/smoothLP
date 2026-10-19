@@ -79,7 +79,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         self,
         lam: float | Literal["cv", "gcv"] = "gcv",
         lam_grid_lower: float = -3.0,
-        lam_grid_upper: float = 1.0,
+        lam_grid_upper: float = 3.0,
         lam_grid_size: int = 1_000,
         partial_out: bool = True,
     ):
@@ -123,7 +123,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
                 **params,
             )
         )
-        shock, Y, P, mask, u, theta_hat, vcov_nw, lam, tune_trace = (
+        shock, Y, mask, u, theta_hat, vcov_nw, lam, tune_trace = (
             np.array(r) for r in res
         )
         print(f"Runtime of {(datetime.now() - s).total_seconds()}s")
@@ -131,7 +131,6 @@ class SmoothLocalProjection(AbstractLocalProjection):
         return SmoothLocalProjectionResult(
             self,
             self.knots,
-            P,
             lam,
             theta_hat,
             vcov_nw,
@@ -233,12 +232,10 @@ class SmoothLocalProjection(AbstractLocalProjection):
         D = jnp.eye(k)
         for i in range(n_diff):
             D = jnp.diff(D, axis=0)
+        basis_penalty = D.T @ D
         # Coefficients are basis-major: (b1*x1, ..., b1*xn, b2*x1, ...).
         # Therefore every entry of the basis penalty is an n-by-n diagonal
         # block, preserving the block-banded structure in the basis dimension.
-        basis_penalty = D.T @ D
-        P = jnp.kron(basis_penalty, jnp.eye(n))
-
         # Slot i stores the block at (column + i, column). The Gram
         # matrix needs three bands; the penalty needs n_diff + 1.
         n_bands = max(3, n_diff + 1)
@@ -257,7 +254,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         XTy = XTy.reshape((q, 1))
 
         if lam_selection is not None:
-            lam_grid = N * jnp.pow(
+            lam_grid = jnp.pow(
                 10, jnp.linspace(lam_grid_lower, lam_grid_upper, lam_grid_size)
             )
             n_fitted = exog.shape[1] * (H + 1) if partial_out_exog else 0
@@ -273,7 +270,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
                     n_fitted,
                 )
             elif lam_selection == "cv":
-                # lam, tune_trace = 10.0, None
+                # lam, tune_trace = 10.0, Non,e
                 lam, tune_trace = SmoothLocalProjection._tune_lambda_cv(
                     lam_grid,
                     B,
@@ -282,14 +279,16 @@ class SmoothLocalProjection(AbstractLocalProjection):
                     shock,
                     exog,
                     mask_s,
+                    N,
                     n_bands,
                     partial_out_exog,
                 )
         else:
             tune_trace = None
+        lam_scaled = lam * N
 
         # Here I need to tune lambda
-        design = XTX_stacked + lam * Ps
+        design = XTX_stacked + lam_scaled * Ps
         L = blocked_cholesky(design)
         theta = block_solve(L, XTy.reshape((k, n, 1)))
         theta = block_solve(L, theta, lower=False).reshape((q, 1))
@@ -309,7 +308,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         selector = jnp.eye(q)[shock_indices]
 
         # Compute W = bread^-1 selector.T.
-        bread_vcov = XTX_stacked + 0.1 * lam * Ps
+        bread_vcov = XTX_stacked + 0.1 * lam_scaled * Ps
         bread_L = blocked_cholesky(bread_vcov)
         W = block_solve(bread_L, selector.T.reshape((k, n, n_shocks * k)), lower=True)
         W = block_solve(bread_L, W, lower=False)
@@ -337,7 +336,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         coef = theta[shock_indices].reshape((n_shocks, k)).T
 
         shocks_partial = shock if partial_out_exog else None
-        return shocks_partial, Ys, P, mask_s, us, coef, lrv, lam, tune_trace
+        return shocks_partial, Ys, mask_s, us, coef, lrv, lam, tune_trace
 
     @staticmethod
     def _tune_lambda(
@@ -369,10 +368,9 @@ class SmoothLocalProjection(AbstractLocalProjection):
         ApA = jnp.ones_like(s) - reference_lam * s
 
         def eval_f(lam):
-            d = 1 / (1 + (lam - reference_lam) * s)
+            d = 1 / (1 + (N * lam - reference_lam) * s)
             bd = b * d
             rss = ypy - 2 * jnp.dot(b, bd) + jnp.dot(bd * ApA, bd)
-            # A is whitened at reference_lam, so A.T @ A is not identity.
             dfit = jnp.sum(ApA * d) + n_fitted
             gcv = rss / (1 - dfit / N) ** 2
             aic = jnp.log(rss) + 2 * dfit / N
@@ -396,12 +394,12 @@ class SmoothLocalProjection(AbstractLocalProjection):
         shock,
         exog,
         mask_s,
+        N: int,
         n_bands: int,
         partial_out_exog: bool,
     ):
         n_folds = 5
         k, _, n, _ = Ps.shape
-        # n_shocks = shock.shape[1]
         n_splines = B.shape[1]
         Th = jnp.sum(mask_s, axis=0)
 
@@ -468,11 +466,10 @@ class SmoothLocalProjection(AbstractLocalProjection):
             b = Z.T @ XTy
             b_test = Z.T @ XTy_test
 
-            # Apa is a diagonal matrix
             At_T_At = Z.T @ fill(XTX_test) @ Z
 
             def eval_f(lam):
-                d = 1 / (1 + (lam - reference_lam) * s)
+                d = 1 / (1 + (N * (n_folds - 1) / n_folds * lam - reference_lam) * s)
                 bd = b * d
                 rss = ypy - 2 * b_test.T @ bd + bd.T @ At_T_At @ bd
                 return rss
@@ -497,7 +494,6 @@ class SmoothLocalProjectionResult:
 
     model: SmoothLocalProjection
     knots: np.ndarray
-    P: np.ndarray
 
     lam: float
     coef: np.ndarray
