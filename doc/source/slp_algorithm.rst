@@ -14,7 +14,7 @@ Reference
 ---------
 
 Here I first describe in very broad terms what the paper does.
-The next section then goes into details on my implementation.
+The next section describes my implementation in detail.
 
 Local projections
 ^^^^^^^^^^^^^^^^^
@@ -130,6 +130,8 @@ and the lag-:math:`\ell` score covariance
    = \frac{1}{T}\sum_{t=\ell+1}^{T-H_{\min}}
      s_t s_{t-\ell}^{\mathsf T}.
 
+Here, :math:`T` is the input series length and :math:`H_{\min}` is the smallest
+projection horizon, typically either 0 (in our setting) or 1.
 With Bartlett weights :math:`w_{\ell}=1-\ell/(L+1)`, the estimator is
 
 .. math::
@@ -145,7 +147,7 @@ With Bartlett weights :math:`w_{\ell}=1-\ell/(L+1)`, the estimator is
      \right]
      A_{\lambda}^{-1}.
 
-Barnichon and Brownlees set the bandwidth to :math:`L=H`. For inference they
+Barnichon and Brownlees set the bandwidth to :math:`L=H`, the maximum projection horizon. For inference they
 use a penalty equal to one tenth of the degree of shrinkage selected by
 cross-validation. If :math:`\widehat b` and
 :math:`\widehat V(\widehat b)` denote the impulse-response spline coefficients
@@ -173,18 +175,18 @@ Implementation
 Masking Observations
 ^^^^^^^^^^^^^^^^^^^^
 
-The primary change that we need to implement is masking of observations.
+The primary change that we need to implement is the masking of observations.
 An intuitive implementation is to simply cut these observations out before
 giving the data to the estimation method.
 However, since the package assumes one continuous time series, this will effectively
 treat observations from right before and after the break as being closely related.
 
-A better approach is to within the estimation package mask observations that fall within the window
-directly.
+A better approach is to mask observations that fall within the window directly
+within the estimation package.
 When a mask is provided, I omit an observation if :math:`t`, :math:`t+h`
 or any observation in between is masked.
-Note in the following (and in the code), that :math:`m_{th}` is defined as an indicator on whether this observation
-can be used, and thus inverted compared to the public function interface.
+In the following (and in the code), :math:`m_{th}` indicates whether an observation
+can be used, so its meaning is the opposite of the mask in the public function interface.
 
 
 Spline Support
@@ -192,47 +194,51 @@ Spline Support
 
 One difference between the paper and my code is that in the paper the splines start at -2,
 while I use one additional spline.
-This corresponds to the code that the authors provide and makes it so that the sum of all splines at each
-interior knot point always sums up to 1.
+This corresponds to the code that the authors provide and ensures that the splines sum to 1 at each
+interior knot.
 This small change improves how the penalty is applied.
 
 
-Partialing Out Controls
-^^^^^^^^^^^^^^^^^^^^^^^
+Partialling Out Controls
+^^^^^^^^^^^^^^^^^^^^^^^^
 
 As the paper mentions, we can apply :eq:`slp-basis-expansion` to all parameters or only a subset of them.
 I implement this through partialling out controls.
-If selected, variables passed as controls are not expanded into basis, but instead partialled out before
+If selected, variables passed as controls are not expanded in the spline basis, but instead partialled out before
 the penalized fit.
-Since the expansion and smoothing penalty search are quite expensive, this provides a severe performance boost,
+Since the expansion and smoothing penalty search are quite expensive, this provides a substantial performance boost,
 in particular for a large number of controls.
+My understanding is that when no penalty is applied, these two estimation proceedures produce identical results up to numeric precision
+(in theory, in practice without applying a penalty the estimator is no longer well defined).
 
 Furthermore, my code selects only a single penalty parameter. Restricting the penalty to apply only to the
-irf of interest therefore means that the penalty is selected optimally for this irf, not for all irfs.
-This might be particularly important, if we have a large number of controls many of which have little to no
-additional impact and thus relatively much noise to signal.
+IRF of interest therefore means that the penalty is selected optimally for this IRF, not for all IRFs.
+This might be particularly important if we have a large number of controls, many of which have little to no
+additional impact and thus a relatively high ratio of noise to signal.
 
 
-Defining the Penalty and Design Matrix
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Defining the Penalty and Gram Matrix
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Especially when not partialling out controls and at longer horizon these two matrices become quite large.
+Especially when not partialling out controls and at longer horizons, these two matrices become quite large.
 For example, at :math:`H=100` with 90 controls, we have about 9000 expanded coefficients.
-With 2000 observations, the full stacked control matrix defined in the paper would consume over 13GB of memory.
+With 2000 observations, the full stacked control matrix defined in the paper would consume over 13 GB of memory.
 
-I can however avoid materializing this matrix and also reduce the 9000 squared design matrix severely.
-The key is that in the expanded form only closely adjacent spline coefficients are correlated.
-But spline 3 and 15 are clearly uncorrelated, since only one of them can be non-negative for each horizon :math:`h`.
+I can, however, avoid materializing this matrix and also greatly reduce the storage required for the
+:math:`9000\times9000` Gram matrix.
+The key is that, in the expanded form, only closely adjacent spline basis functions overlap.
+For example, splines 3 and 15 have disjoint support, so at most one can be nonzero at each horizon :math:`h`.
 
 Start by defining the expanded regressors as :math:`\tilde{x}_{th} = b_h \otimes x_t`,
-where :math:`b_h` evaluates the :math:`K` splines at knot :math:`h`.
+where :math:`b_h` evaluates the :math:`K` splines at horizon :math:`h`.
 From this :math:`\tilde{x}_{th} \tilde{x}_{th}^T = (b_h b_h^T) \otimes (x_t x_t^T)`.
-The key is that :math:`b_h b_h^T` is not a dense matrix, but has non-zero entries only on the first 2 off-diagonal
+The key is that :math:`b_h b_h^T` is not a dense matrix, but has non-zero entries only on the main diagonal
+and the first two off-diagonals on either side at the integer horizons used here
 (when fitting cubic splines, which is the only setting I currently support).
 
-From this I can compute the design matrix :math:`X^TX = \sum_{h=0}^{H} \sum_{t=1}^T m_{th} \tilde x_{th} \tilde x_{th}^T`.
-The entire matrix is thus a block-banded matrix and since it is square I only ever compute the entries on and below the diagonal.
-This massively reduces compute and storage required for this matrix.
+From this I can compute the Gram matrix :math:`X^TX = \sum_{h=0}^{H} \sum_{t=1}^T m_{th} \tilde x_{th} \tilde x_{th}^T`.
+The entire matrix is thus a block-banded matrix and since it is symmetric I only ever compute the entries on and below the diagonal.
+This greatly reduces the computation and storage required for this matrix.
 
 Similarly, I define the penalty matrix as :math:`P = (D^{\mathsf T} D) \otimes I` which gives a similar block-banded structure.
 The matrix :math:`D` is computed through repeated differencing of the identity matrix,
@@ -245,24 +251,24 @@ Penalty Fitting
 ^^^^^^^^^^^^^^^
 
 I look for the optimal penalty across a grid that by default ranges from :math:`10^{-3}` to :math:`10^3`.
-the base 10 log of the grid is spaced evenly and by default I evaluate 1000 grid points. This is a rather wide grid,
+The base-10 logarithms of the grid points are evenly spaced, and by default I evaluate 1000 grid points. This is a rather wide grid,
 but I have little guidance on the typical range and often found even quite extreme values.
 I scale the penalty internally by :math:`N`, which is the total number of observations
 (not the length of the input series, but the actual number of observations in the smoothing step,
-typically close to the input length times the max horizon).
+typically close to the input length times the maximum horizon).
 This is intended to make the grid adjust for the sample size.
 
-For tuning I mostly use two measures, a generalized cross-validation error and a 5-fold cross validation error.
+For tuning I mostly use two measures, a generalized cross-validation error and a 5-fold cross-validation error.
 The first is much faster, while the second is closer to the algorithm suggested by the authors.
 
 Both approaches effectively compute the RSS, so in order to make evaluating so many grid points computationally
 feasible, I need a cheap way of finding the fitted values for any given smoothing parameter.
-For this I use the Demmler-Reinsch orthogonalization.
+For this I use the Demmler–Reinsch orthogonalization.
 I first describe this method in general, before going into implementation details of the two tuning approaches.
 
-My DR implementation closely follows Ruppert, Wand and Carroll [RWC2003]_.
-One notable difference is that my design matrix is ill-conditioned, since there are more splines than horizons.
-To fix this, I add a multiple of the penalty matrix to the design matrix.
+My Demmler–Reinsch implementation closely follows Ruppert, Wand and Carroll [RWC2003]_.
+One notable difference is that my Gram matrix is singular, since there are more splines than horizons.
+To address this, I add a multiple of the penalty matrix to the Gram matrix.
 Below I show the algorithm with this modification.
 
 The goal is to compute fitted values
@@ -272,9 +278,10 @@ The goal is to compute fitted values
    \hat y_\lambda = X (X^{\mathsf T} X + \lambda P)^{-1} X^{\mathsf T} y
 
 for many different values of :math:`\lambda`.
-It does so by rotating the design such that applying the penalty is a simple multiplication.
+In the formulas below, :math:`\lambda` denotes the internally scaled penalty.
+The method does so by rotating the design such that applying the penalty is a simple multiplication.
 
-First, define :math:`L` as the cholesky of
+First, define :math:`L` as the Cholesky factor of
 
 .. math::
 
@@ -303,16 +310,18 @@ This gives the fitted values as
 
 .. math::
 
-   \hat y
+   \hat y_\lambda
    &= X L^{-\mathsf T} U (I_n + (\lambda-\overline{\lambda}) S)^{-1}
-      U^{\mathsf T} L^{-\mathsf T} X^{\mathsf T} y \\
+      U^{\mathsf T} L^{-1} X^{\mathsf T} y \\
    &= A (I_n + (\lambda-\overline{\lambda}) S)^{-1} A^{\mathsf T} y,
 
 with :math:`A = X L ^{-\mathsf T} U`.
-Note that :math:`A^{\mathsf T} y` is a column vector.
-Thus :math:`(I_n + (\lambda - \overline\lambda) s)^{-1} (A^{\mathsf T} y)` is also a column vector given by :math:`\left( \frac{b}{1-\lambda s} \right) = d`,
+Here, :math:`I_n` is the identity matrix with dimension equal to the number of spline coefficients.
+Let :math:`b=A^{\mathsf T}y` and let :math:`s_j` be the :math:`j`-th diagonal entry of :math:`S`.
+Then :math:`d=(I_n+(\lambda-\overline\lambda)S)^{-1}b` has entries
+:math:`d_j=b_j/[1+(\lambda-\overline\lambda)s_j]`.
 
-This reduces computing the RSS greatly:
+This greatly reduces the cost of computing the residual sum of squares (RSS):
 
 .. math::
 
@@ -323,48 +332,51 @@ This reduces computing the RSS greatly:
       + d^{\mathsf T} A^{\mathsf T}A d \\
    &= y^{\mathsf T}y
       - 2 b^{\mathsf T} d
-      + d^{\mathsf T} \operatorname{diag} \left( 1-\overline\lambda S \right) d
+      + d^{\mathsf T} \left( I_n-\overline\lambda S \right) d
 
 where the last line uses the fact that
 
 .. math::
     A^{\mathsf T} A &= U^{\mathsf T}L^{-1} X^{\mathsf T} X L^{-\mathsf T} U\\
-    & = U^{\mathsf T}L^{-1} \left( L L^{\mathsf T} - \overline\lambda P) \right) L^{-\mathsf T} U\\
+    & = U^{\mathsf T}L^{-1} \left( L L^{\mathsf T} - \overline\lambda P \right) L^{-\mathsf T} U\\
     & = I_n - \overline \lambda U^{\mathsf T} U S U^{\mathsf T} U = I_n - \overline\lambda S
 
 With this, evaluating a single grid point :math:`\lambda` requires only cheap multiplications and vector products.
 
-The gcv can then be computed from
+The GCV criterion can then be computed from
 
 .. math::
 
     GCV(\lambda) = RSS(\lambda) / (1 - d_{fit}(\lambda) / N)^2
 
-where :math:`d_{fit}(\lambda) = 1^{\mathsf T} \left( \frac{1}{1-(\lambda - \overline\lambda)s} \right)`.
+where :math:`d_{fit}(\lambda) = \sum_{j=1}^{n} \frac{1-\overline\lambda s_j}{1+(\lambda-\overline\lambda)s_j}`
+is the effective number of fitted parameters in the penalized fit. When controls are
+partialled out, their fitted degrees of freedom are added to this quantity.
 
 
-For the 5-fold cross validation tuning, I first compute the stacked X and Y arrays.
+For the 5-fold cross-validation tuning, I first compute the stacked :math:`X` and :math:`Y` arrays.
 I then count the number of available observations along each horizon and then split each horizon into 5
-equal sized buckets.
-Note, that however the bucket for the first horizon is larger than the one for the last horizon.
-So an X observation might fall in bucket 1 in horizon 0 and bucket 2 in horizon 100.
+equally sized buckets.
+However, a bucket for the first horizon is larger than one for the last horizon.
+So an observation might fall in bucket 1 at horizon 0 and bucket 2 at horizon 100.
 
-With this grouping, for each bucket I use the observations of all other buckets as training sample
-and the bucket for evaluation.
-I perform a Demmler-Reisch orthogonalization like for the GCV tuning,
+With this grouping, for each bucket I use the observations of all other buckets as the training sample
+and the held-out bucket for evaluation.
+I perform a Demmler–Reinsch orthogonalization like for the GCV tuning,
 but with the slight difference that fitted values are only computed for the validation data.
-Let tilde denote test data, I compute
+Using tildes to denote validation data, I compute
 
 .. math::
 
-    \hat{\tilde y} = \tilde X (X^{\mathsf T} X + \lambda P)^{-1} X^T y
+    \hat{\tilde y} = \tilde X (X^{\mathsf T} X + \lambda P)^{-1} X^{\mathsf T} y
 
 The further steps of the algorithm then follow immediately, with the single exception that
-:math:`\tilde A ^{\mathsf T}\tilde A} is not longer a diagonal matrix.
+:math:`\tilde A^{\mathsf T}\tilde A` is no longer a diagonal matrix,
+where :math:`\tilde A=\tilde X L^{-\mathsf T}U`.
 
 In general, I've heavily optimized this code.
-The cholesky decompositions can exploit the sparsity of the design and penalty matrix and are thus rather fast.
-But since the inverse of the cholesky decomposition is be a dense matrix
+The Cholesky decompositions can exploit the sparsity of the Gram and penalty matrices and are thus rather fast.
+But since the inverse of the Cholesky factor is a dense matrix
 (at least I'm not aware of any sparse structure in this matrix),
 the eigenvalue decomposition is performed on a dense matrix and thus likely the most expensive step of this
 algorithm.
@@ -374,8 +386,14 @@ algorithm.
 Covariance Estimation
 ^^^^^^^^^^^^^^^^^^^^^
 
-When estimating the covariance I follow the original paper and estimate a HAC covariance using 0.1 times the penalty
-in the actual regression.
+Here I'm not sure if I understand the paper correclty.
+They say that they use a penalty scaled by 0.1 in the covariance estimation.
+But they also state in a footnote, that smoothing estimators typically have some bias and that constructing CIs with an undersmoothed version can reduce this bias.
+This would mean refitting the parameter vector and ultimately lead to CIs that are note centered on the actual estiamte.
+They however never state that they do suggest this.
+I don't go so far, I just undersmooth in the sandwich estimator, but do not reestimate the parameter vector.
+Here their R and matlab code also seem to disagree, with matlab reestimating and R not even undersmoothen the sandwich.
+
 Note that when partialling out controls, I estimate only the covariance matrix for the shocks.
 Similarly, when keeping controls in the main estimation, I'm not interested in estimating covariances of these controls.
 To avoid estimating these, I define a matrix :math:`R` that selects only the relevant entries of the full parameter
@@ -385,12 +403,30 @@ This allows me to rewrite the covariance matrix to compute the long-run variance
 
 .. math::
 
-    V(\tilde\theta) &= R(X^{\mathsf T}X + 0.1 \lambda P)^{-1} \left( \Gamma_0 + 2 \sum_{l=1}^{H} w_l \Gamma_l \right) (X^{\mathsf T} X + 0.1\lambda P)^{-1} R^{\mathsf T}\\
-    &= W \left( \sum_t X_t^{\mathsf T}U_t U_t^{\mathsf T} X_t + 2 \sum_{l=1}^{H} w_l \sum_t X_t^{\mathsf T} U_t U_{t-l}^{\mathsf T} X_{t-l} \right) W^{\mathsf T}\\
-    &= \sum_t \tilde X_t^{\mathsf T} U_t U_t^{\mathsf T} \tilde X_t + 2 \sum_{l=1}^{H} w_l \sum_t \tilde X_t^{\mathsf T} U_t U_{t-l}^{\mathsf T} \tilde X_{t-l}
+    W &= R(X^{\mathsf T}X + 0.1\lambda P)^{-1},
+    \qquad \tilde X_t = X_t W^{\mathsf T}, \\
+    C_l &= \sum_t X_t^{\mathsf T}\widehat U_t
+                  \widehat U_{t-l}^{\mathsf T}X_{t-l}.
 
-Since :math:`X_t` has dimensions :math:`(H+1)\times k`, where :math:`k` is the number of shocks and controls multiplied with the number of splines,
-:math:`\tilde X_t` is much smaller since it's second dimension is only the number of shocks times the number of splines.
+Here, :math:`C_l` is an unnormalized lag covariance sum (equal to
+:math:`T\widehat\Gamma_l` above), and each sum includes only available time pairs.
+Then
+
+.. math::
+
+    \widehat V(\tilde\theta)
+    &= W \left[ C_0 + \sum_{l=1}^{H} w_l
+                \left(C_l+C_l^{\mathsf T}\right) \right] W^{\mathsf T}\\
+    &= \sum_t \tilde X_t^{\mathsf T}\widehat U_t
+                     \widehat U_t^{\mathsf T}\tilde X_t \\
+    &\quad + \sum_{l=1}^{H} w_l \sum_t
+       \left[\tilde X_t^{\mathsf T}\widehat U_t
+             \widehat U_{t-l}^{\mathsf T}\tilde X_{t-l}
+       + \tilde X_{t-l}^{\mathsf T}\widehat U_{t-l}
+             \widehat U_t^{\mathsf T}\tilde X_t\right].
+
+Since :math:`X_t` has dimensions :math:`(H+1)\times k`, where :math:`k` is the number of shocks and controls multiplied by the number of splines,
+:math:`\tilde X_t` may be much smaller since its second dimension is only the number of shocks times the number of splines.
 
 
 
@@ -402,5 +438,5 @@ References
    Statistics*, 101(3), 2019, pp. 522–530.
    https://doi.org/10.1162/rest_a_00778
 
-.. [RWC2003] David Ruppert and M. P. Wand and R. J. Carroll.
-    "Semiparametric Regression" *Cambridge University Press* 2003
+.. [RWC2003] David Ruppert, M. P. Wand, and R. J. Carroll.
+   *Semiparametric Regression.* Cambridge University Press, 2003.
