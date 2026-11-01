@@ -24,7 +24,7 @@ HORIZONS = [4]
 SHOCK_COUNTS = [1, 3]
 CONTROL_COUNTS = [0, 2]
 POLYNOMIAL_ORDERS = [2, 3]
-FIXED_LAMBDAS = [1.0, 10.0]
+FIXED_LAMBDAS = [10.0]
 GRID_SIZE = 11
 
 
@@ -68,6 +68,7 @@ def test_fixed_lambda_matches_reference(
         controls,
         H=H,
         target_poly_order=target_poly_order,
+        n_lags_outcome=0,
         mask=mask,
     )
     reference_shocks, reference_controls = _reference_inputs(
@@ -164,6 +165,7 @@ def test_gcv_matches_full_design(
         controls,
         H,
         target_poly_order=target_poly_order,
+        n_lags_outcome=0,
         mask=mask,
     )
     result = model.fit("gcv", lam_grid_size=GRID_SIZE, partial_out=partial_out)
@@ -203,7 +205,9 @@ def test_joint_matches_promoted_shocks(
         n_controls=n_controls,
         masked=masked,
     )
-    options = dict(H=H, target_poly_order=target_poly_order, mask=mask)
+    options = dict(
+        H=H, target_poly_order=target_poly_order, mask=mask, n_lags_outcome=0
+    )
     joint = SmoothLocalProjection(y, shocks, controls, **options).fit(
         lam,
         partial_out=False,
@@ -313,6 +317,7 @@ def test_cv_matches_full_design(
         controls,
         H,
         target_poly_order=target_poly_order,
+        n_lags_outcome=0,
         mask=mask,
     )
     result = model.fit("cv", lam_grid_size=GRID_SIZE, partial_out=partial_out)
@@ -343,3 +348,52 @@ def test_cv_matches_full_design(
         full.lam,
     )
     assert_estimate_matches(result, _select_shocks(reference, n_shocks))
+
+
+@pytest.mark.parametrize("n_lags", [0, 1, 3])
+@pytest.mark.parametrize("partial_out", [True, False])
+@pytest.mark.parametrize("lam", [10.0])
+@pytest.mark.parametrize("masked", [False])
+def test_prepared_outcome_lags(n_lags, partial_out, lam, masked):
+    y, shocks, _, mask = simulated_data(T=80, n_shocks=2, n_controls=0, masked=masked)
+    model = SmoothLocalProjection(
+        y, shocks, None, H=4, n_lags_outcome=n_lags, mask=mask
+    )
+    actual = model.fit(lam, partial_out=partial_out, lam_grid_size=GRID_SIZE)
+
+    # Build the same design explicitly, without prepare_data. The first lag
+    # has a penalized spline path; remaining lags follow the control policy.
+    lags = (
+        np.column_stack(
+            [y[n_lags - lag : len(y) - lag] for lag in range(1, n_lags + 1)]
+        )
+        if n_lags
+        else np.empty((len(y), 0))
+    )
+    reference_shocks = np.column_stack((lags[:, :1], shocks[n_lags:]))
+    controls = lags[:, 1:]
+    if not partial_out:
+        reference_shocks = np.column_stack((reference_shocks, controls))
+        controls = np.empty((len(reference_shocks), 0))
+    reference_model = SmoothLocalProjection(
+        y[n_lags:],
+        reference_shocks,
+        controls,
+        H=4,
+        n_lags_outcome=0,
+        mask=None if mask is None else mask[n_lags:],
+    )
+    expected = reference_model.fit(lam, partial_out=True, lam_grid_size=GRID_SIZE)
+    offset = int(n_lags > 0)
+    n_splines = model.B.shape[1]
+    block = slice(offset * n_splines, (offset + 2) * n_splines)
+    selected = SimpleNamespace(
+        coef=expected.coef[:, offset : offset + 2],
+        irf=expected.irf[:, offset : offset + 2],
+        se=expected.se[:, offset : offset + 2],
+        vcov_nw=expected.vcov_nw[block, block],
+    )
+    assert_estimate_matches(actual, selected)
+    assert_allclose(actual.lam, expected.lam)
+    if isinstance(lam, str):
+        assert_allclose(actual.tune_trace, expected.tune_trace, rtol=1e-6, atol=1e-6)

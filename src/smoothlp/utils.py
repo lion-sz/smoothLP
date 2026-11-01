@@ -1,9 +1,11 @@
+from functools import partial
 from typing import Literal
 
 import numpy as np
 import jax
 from jax import numpy as jnp, scipy as jsp, Array, lax
 from jaxtyping import Float
+import opt_einsum as oe
 
 
 def bspline(p, knots, x):
@@ -114,44 +116,56 @@ def demean(
     return data
 
 
-def _lrv_np(Xu: Float[np.ndarray, "T k"], lags: int) -> Float[np.ndarray, "k k"]:
-    cross = 0.5 * Xu
-    temp = Xu.copy()
-    for j in range(1, lags + 1):
-        w = 1 - j / (lags + 1)
-        temp = np.roll(temp, -1, axis=0)
-        temp[-1, :] = 0.0
-        cross += w * temp
-    cross = Xu.T @ cross
-    lrv = cross + cross.T
-    return lrv
+def _lrv_np(
+    Xu: Float[np.ndarray, "T k h"],
+    lags: Float[np.ndarray, " h"],
+    max_lags: int,
+) -> Float[np.ndarray, "k k h"]:
+    """Batched Bartlett long-run covariance with a lag count per horizon."""
+    weights = np.maximum(
+        1 - np.arange(1, max_lags + 1)[:, None] / (lags + 1),
+        0,
+    )
+    weighted = 0.5 * Xu
+    shifted = Xu.copy()
+    for weight in weights:
+        shifted = np.roll(shifted, -1, axis=0)
+        shifted[-1, :, :] = 0.0
+        weighted += weight * shifted
+    cross = oe.contract("tih, tjh -> ijh", Xu, weighted)
+    return cross + np.swapaxes(cross, 0, 1)
 
 
-def _lrv_jax(Xu: Float[Array, "T k"], lags: int) -> Float[Array, "k k"]:
-    def accumulate(carry, lag):
+@partial(jax.jit, static_argnames=["max_lags"])
+def _lrv_jax(
+    Xu: Float[Array, "T k h"], lags: Float[Array, " h"], max_lags: int
+) -> Float[Array, "k k h"]:
+    weights = jnp.arange(1, max_lags + 1)[:, None] / (lags + 1)
+    weights = jnp.maximum(1 - weights, 0)
+
+    def accumulate(carry, weight):
         shifted, weighted = carry
 
         # Advance one time step, zero-padding instead of wrapping.
-        shifted = jnp.roll(shifted, -1, axis=0).at[-1].set(0.0)
-        weight = 1.0 - lag / (lags + 1)
+        shifted = jnp.roll(shifted, -1, axis=0).at[-1, :, :].set(0.0)
         return (shifted, weighted + weight * shifted), None
 
     (_, weighted), _ = lax.scan(
         accumulate,
         (Xu, 0.5 * Xu),
-        jnp.arange(1, lags + 1),
+        weights,
     )
 
-    cross = Xu.T @ weighted
-    lrv = cross + cross.T
+    cross = oe.contract("tih, tjh -> ijh", Xu, weighted)
+    lrv = cross + jnp.swapaxes(cross, 0, 1)
     return lrv
 
 
-def comp_lrv(Xu, lags: int):
+def comp_lrv(Xu, lags, max_lags: int = None):
     if isinstance(Xu, np.ndarray):
-        lrv = _lrv_np(Xu, lags)
+        lrv = _lrv_np(Xu, lags, max_lags)
     elif isinstance(Xu, jnp.ndarray):
-        lrv = _lrv_jax(Xu, lags)
+        lrv = _lrv_jax(Xu, lags, max_lags)
     else:
         raise ValueError("Xu must be a numpy or jax array")
     return lrv
@@ -179,19 +193,22 @@ def _build_stacked_np(
     values wrap beyond the sample, but their inclusion flags are always zero.
     """
     T = len(endog)
-    Ys = np.empty((T, H + 1), dtype=endog.dtype)
-    mask_s = np.empty((T, H + 1), dtype=mask.dtype)
-    current_mask = mask.copy() if mask_type in ("both", "y") else np.ones_like(mask)
-    for h in range(H + 1):
-        Ys[:, h] = np.roll(endog, -h)
-        mask_s[:, h] = current_mask
-        next_mask = np.roll(current_mask, -1)
-        if mask_type == "both":
-            next_mask[current_mask == 0] = 0
-        next_mask[-1] = 0
-        current_mask = next_mask
-    if mask_type in ("both", "x"):
-        mask_s *= mask[:, np.newaxis]
+    ys_ind = np.arange(T)[:, np.newaxis] + np.arange(H + 1)[np.newaxis, :]
+    ys_ind = np.where(ys_ind >= T, ys_ind - T, ys_ind)
+    Ys = endog[ys_ind]
+
+    if mask_type == "x":
+        ms = np.repeat(mask[:, np.newaxis], H + 1, axis=1)
+    elif mask_type == "y":
+        ms = np.ones((T, H + 1), dtype=mask.dtype)
+    else:
+        ms = mask[ys_ind]
+    ms[T - np.arange(1, H + 1), np.arange(1, H + 1)] = 0
+    mask_s = (np.cumsum(ms, axis=1) == np.arange(1, H + 2)[np.newaxis, :]).astype(
+        mask.dtype
+    )
+    if mask_type == "y":
+        mask_s = mask_s * mask[ys_ind]
     return Ys, mask_s
 
 
@@ -203,30 +220,68 @@ def _build_stacked_jax(
 ) -> tuple[Float[Array, "T H+1"], Float[Array, "T H+1"]]:
     """JAX equivalent of build_stacked_np; mask uses 1=include, 0=omit."""
 
-    def fy(ty, _):
-        typ = jnp.roll(ty, -1)
-        return typ, ty
+    T = len(endog)
+    ys_ind = jnp.arange(T)[:, jnp.newaxis] + jnp.arange(H + 1)[jnp.newaxis, :]
+    ys_ind = jnp.where(ys_ind >= T, ys_ind - T, ys_ind)
+    Ys = endog[ys_ind]
 
-    Ys = lax.scan(fy, endog, length=H + 1)[1]
-    Ys = Ys.swapaxes(0, 1)
-
-    def fm(tm, _):
-        tmp = jnp.roll(tm, -1)
-        if mask_type == "both":
-            tmp = jnp.where(tm == 0, 0, tmp)
-        tmp = tmp.at[-1].set(0)
-        return tmp, tm
-
-    if mask_type in ("both", "y"):
-        start = mask
+    if mask_type == "x":
+        ms = jnp.repeat(mask[:, jnp.newaxis], H + 1, axis=1)
+    elif mask_type == "y":
+        ms = jnp.ones((T, H + 1), dtype=mask.dtype)
     else:
-        start = jnp.ones_like(mask)
-    mask_s = lax.scan(fm, start, length=H + 1)[1]
-    mask_s = mask_s.swapaxes(0, 1)
-    if mask_type in ("both", "x"):
-        mask_s = mask_s * mask[:, np.newaxis]
-
+        ms = mask[ys_ind]
+    ms = ms.at[T - jnp.arange(1, H + 1), jnp.arange(1, H + 1)].set(0)
+    mask_s = (jnp.cumsum(ms, axis=1) == jnp.arange(1, H + 2)[jnp.newaxis, :]).astype(
+        mask.dtype
+    )
+    if mask_type == "y":
+        mask_s = mask_s * mask[ys_ind]
     return Ys, mask_s
+
+
+def prepare_data(
+    engine: Literal["jax", "np"],
+    endog: Float[Array, " T"],
+    shock: Float[Array, "T s"],
+    exog: Float[Array, "T k"],
+    mask: Float[Array, " T"],
+    H: int,
+    n_lags_outcome: int,
+    mask_type: str = "both",
+):
+    if engine == "jax":
+        lib = jnp
+    elif engine == "np":
+        lib = np
+    else:
+        raise ValueError("Can only use jax or np as engine.")
+    # Add the lags to the outcomes
+    if n_lags_outcome >= 1:
+        ind = (
+            lib.arange(len(endog))[:, None] - lib.arange(1, n_lags_outcome + 1)[None, :]
+        )
+        lags = endog[ind]
+        shock = lib.concat([lags[:, [0]], shock], axis=1)
+        if exog is None:
+            exog = lags[:, 1:]
+        else:
+            exog = lib.concat([lags[:, 1:], exog], axis=1)
+    Y = endog[n_lags_outcome:]
+    shock = shock[n_lags_outcome:, :]
+    if exog is not None:
+        exog = exog[n_lags_outcome:, :]
+    if mask is not None:
+        mask = mask[n_lags_outcome:]
+
+    # Build the stacked arrays
+    if mask is None:
+        mask = lib.ones(len(Y))
+    if engine == "jax":
+        Ys, mask_s = _build_stacked_jax(Y, mask, H, mask_type)
+    elif engine == "np":
+        Ys, mask_s = _build_stacked_np(Y, mask, H, mask_type)
+    return Y, Ys, shock, exog, mask_s
 
 
 def build_stacked(

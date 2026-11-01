@@ -23,3 +23,23 @@ lower = res$irf_lin_low[1, ]
 
 output = data.frame(mean=mean, upper=upper, lower=lower)
 write.csv(output, "./ag_data_irf.csv", row.names=FALSE)
+
+
+res = lp_lin_iv(endog=endog, shock=shock, lags_endog_lin=4, trend=0, confint=1, hor=13, use_nw=TRUE)
+
+mean = res$irf_lin_mean[1, ]
+upper = res$irf_lin_up[1, ]
+lower = res$irf_lin_low[1, ]
+
+output = data.frame(mean=mean, upper=upper, lower=lower)
+write.csv(output, "./ag_data_irf_nw_lags4.csv", row.names=FALSE)
+
+
+res = lp_lin_iv(endog=endog, shock=shock, lags_endog_lin=4, trend=0, confint=1, hor=13, use_nw=FALSE)
+
+mean = res$irf_lin_mean[1, ]
+upper = res$irf_lin_up[1, ]
+lower = res$irf_lin_low[1, ]
+
+output = data.frame(mean=mean, upper=upper, lower=lower)
+write.csv(output, "./ag_data_irf_lags4.csv", row.names=FALSE)

@@ -13,6 +13,7 @@ class AbstractLocalProjection:
     exog: np.ndarray | None
 
     H: int
+    n_lags_outcome: int
 
     mask: np.ndarray | None
     mask_type: str
@@ -24,6 +25,7 @@ class AbstractLocalProjection:
         shock: np.ndarray,
         exog: np.ndarray,
         H: int,
+        n_lags_outcome: int = 1,
         mask: np.ndarray | None = None,
         mask_type: str = "both",
         diff: np.ndarray | None = None,
@@ -45,6 +47,8 @@ class AbstractLocalProjection:
         assert endog.ndim == 1, "Outcome must be one dimensional."
         assert shock.ndim in (1, 2), "Shock must be one or two dimensional."
         assert exog is None or exog.ndim == 2, "Endog must be two dimensional."
+        assert H >= 0, "Horizon must be nonnegative."
+        assert n_lags_outcome >= 0, "n_lags_outcome must be nonnegative."
         assert diff is None or diff.ndim == 1, "Diff must be one dimensional."
         assert mask is None or mask.ndim == 1, "Mask must be one dimensional."
         T = endog.shape[0]
@@ -66,6 +70,7 @@ class AbstractLocalProjection:
         self.exog = exog
 
         self.H = H
+        self.n_lags_outcome = n_lags_outcome
 
         self.mask = mask
         self.mask_type = mask_type

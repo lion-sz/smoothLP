@@ -8,7 +8,7 @@ from jax import numpy as jnp, Array
 from jaxtyping import Float
 import opt_einsum as oe
 
-from smoothlp.utils import comp_lrv, build_stacked, partial_out, invert
+from smoothlp.utils import comp_lrv, prepare_data, partial_out, invert
 from smoothlp.models import AbstractLocalProjection, AbstractLocalProjectionResult
 
 
@@ -34,7 +34,9 @@ class LocalProjection(AbstractLocalProjection):
     instead of `lpirfs`.
     """
 
-    def fit(self, vcov="HC3", engine="np") -> "LocalProjectionResult":
+    def fit(
+        self, vcov="HC3", engine: Literal["jax", "np"] = "jax"
+    ) -> "LocalProjectionResult":
         """Fit the local projection and return a :class:`LocalProjectionResult`
 
         All engines return only shock coefficients and their covariance block.
@@ -43,22 +45,17 @@ class LocalProjection(AbstractLocalProjection):
             vcov (str): The variance-covariance estimator.
                 Must be one of `non-robust`, `HC1`, `HC3` (default), or `HAC`.
             engine (str): The engine to use.
-                Must be one of `np` (default), `sm` and `jax`.
-                Jax can run on a GPU, which can be a lot faster, but also runs only
-                with 32bits, so might lose a lot of precision.
-                Don't use this for main estimations.
+                Must be one of `jax` (default) and `np`.
         """
-        assert engine in ("np", "sm", "jax"), f"Engine '{engine}' not recognised."
+        assert engine in ("np", "jax"), f"Engine '{engine}' not recognised."
         assert vcov in ("non-robust", "HC1", "HC3", "HAC"), (
             f"vcov '{vcov}' not recognised."
         )
 
         if engine == "np":
             engine_func = LocalProjection._estimation_np
-        elif engine == "jax":
-            engine_func = LocalProjection._estimation_jax
         else:
-            engine_func = LocalProjection._estimation_sm
+            engine_func = LocalProjection._estimation_jax
 
         inclusion_mask = None if self.mask is None else (~self.mask).astype(float)
         coef, vcov_vals = engine_func(
@@ -70,21 +67,26 @@ class LocalProjection(AbstractLocalProjection):
             self.diff,
             inclusion_mask,
             self.mask_type,
+            n_lags_outcome=self.n_lags_outcome,
         )
 
         return LocalProjectionResult(self, coef, vcov_vals, vcov, engine)
 
     @staticmethod
-    @partial(jax.jit, static_argnames=["H", "vcov_type", "mask_type"])
-    def _estimation_jax(Y, shock, exog, H, vcov_type, diff, mask, mask_type):
+    @partial(jax.jit, static_argnames=["H", "vcov_type", "mask_type", "n_lags_outcome"])
+    def _estimation_jax(
+        Y, shock, exog, H, vcov_type, diff, mask, mask_type, n_lags_outcome=0
+    ):
         return LocalProjection._estimation(
-            "jax", Y, shock, exog, H, vcov_type, diff, mask, mask_type
+            "jax", Y, shock, exog, H, n_lags_outcome, vcov_type, diff, mask, mask_type
         )
 
     @staticmethod
-    def _estimation_np(Y, shock, exog, H, vcov_type, diff, mask, mask_type):
+    def _estimation_np(
+        Y, shock, exog, H, vcov_type, diff, mask, mask_type, n_lags_outcome=0
+    ):
         return LocalProjection._estimation(
-            "np", Y, shock, exog, H, vcov_type, diff, mask, mask_type
+            "np", Y, shock, exog, H, n_lags_outcome, vcov_type, diff, mask, mask_type
         )
 
     @staticmethod
@@ -94,17 +96,15 @@ class LocalProjection(AbstractLocalProjection):
         shock: Float[Array, "T s"],
         exog: Float[Array, "T k"],
         H: int,
+        n_lags_outcome: int,
         vcov_type: str,
         diff: np.ndarray | None,
         mask: Float[Array, " T"] | None,
         mask_type: str = "both",
     ):
-        T = Y.shape[0]
-        if exog is None:
-            k = 0
-        else:
-            k = exog.shape[1]
-        s = shock.shape[1]
+        assert Y.shape[0] == shock.shape[0], "Shapes do not line up"
+        assert exog is None or Y.shape[0] == exog.shape[0], "Shapes do not line up"
+        assert n_lags_outcome >= 0, "Outcome lags must be nonnegative."
 
         if engine == "jax":
             lib = jnp
@@ -113,12 +113,14 @@ class LocalProjection(AbstractLocalProjection):
         else:
             raise ValueError("Can only use jax or np as engine.")
 
-        # Build the stacked arrays
-        if mask is None:
-            mask = lib.ones(T)
-        Ys, mask_s = build_stacked(engine, Y, mask, H, mask_type)
+        Y, Ys, shock, exog, mask_s = prepare_data(
+            engine, Y, shock, exog, mask, H, n_lags_outcome, mask_type
+        )
+        s = shock.shape[1]
+        k = exog.shape[1] if exog is not None else 0
+
         if diff is not None:
-            Ys = Ys - diff[:, lib.newaxis]
+            Ys = Ys - diff[n_lags_outcome:, lib.newaxis]
         Th = lib.sum(mask_s, axis=0)
 
         # Partial out the exogenous
@@ -166,69 +168,16 @@ class LocalProjection(AbstractLocalProjection):
                 shock_r_m,
                 XpX_inv,
             )
-        if vcov_type == "HAC":
-            Xu = shock_r_m * resid[:, jnp.newaxis, :]
-            lrv = lib.stack(
-                [comp_lrv(Xu[:, :, h], h + 1) for h in range(H + 1)], axis=2
-            )
+        elif vcov_type == "HAC":
+            Xu = shock_r_m * resid[:, None, :]
+            lags = lib.arange(H + 1) + 1
+            lrv = comp_lrv(Xu, lags, H + 1)
             vcov = oe.contract("ikh, klh, ljh -> ijh", XpX_inv, lrv, XpX_inv) * scale
+        if n_lags_outcome >= 1:
+            beta = beta[1:, :]
+            if vcov is not None:
+                vcov = vcov[1:, 1:, :]
         return beta.T, lib.moveaxis(vcov, -1, 0) if vcov is not None else None
-
-    @staticmethod
-    def _estimation_sm(
-        Y: np.ndarray,
-        shock: np.ndarray,
-        exog: np.ndarray | None,
-        H: int,
-        vcov_type: str,
-        diff: np.ndarray | None,
-        mask: np.ndarray | None,
-        mask_type: str = "both",
-    ):
-        from statsmodels.regression.linear_model import OLS
-        from statsmodels.stats.sandwich_covariance import cov_hac
-
-        mask = None if mask is None else mask == 1.0
-        assert vcov_type in ("HC1", "HC3", "HAC")
-        if exog is not None:
-            X = np.concatenate((shock, exog), axis=1)
-        else:
-            X = shock
-        T, k = X.shape
-        coef = np.zeros((H + 1, k))
-        vcov = np.zeros((H + 1, k, k))
-
-        for h in range(H + 1):
-            tx = X[: (T - h), :]
-            if diff is None:
-                ty = Y[h:]
-            else:
-                ty = Y[h:] - diff[: (T - h)]
-
-            if mask is not None:
-                if mask_type == "x":
-                    tx = tx[mask[: (T - h)]]
-                    ty = ty[mask[: (T - h)]]
-                elif mask_type == "y":
-                    tx = tx[mask[h:]]
-                    ty = ty[mask[h:]]
-                elif mask_type == "both":
-                    if h > 0:
-                        mask = mask & np.roll(mask, -1)
-                    tx = tx[mask[: (T - h)]]
-                    ty = ty[mask[: (T - h)]]
-
-            tmod = OLS(ty, tx).fit(cov_type=vcov_type if vcov_type != "HAC" else "HC0")
-            coef[h, :] = tmod.params
-            if vcov_type == "HC1":
-                vcov[h, :, :] = tmod.cov_HC1
-            elif vcov_type == "HC3":
-                vcov[h, :, :] = tmod.cov_HC3
-            else:
-                vcov[h, :, :] = cov_hac(tmod, nlags=h + 1)
-
-        n_shocks = shock.shape[1]
-        return coef[:, :n_shocks], vcov[:, :n_shocks, :n_shocks]
 
 
 @dataclass

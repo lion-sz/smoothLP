@@ -19,42 +19,47 @@ def assert_lp_shocks_equal(actual, expected, *, rtol=1e-7, atol=1e-10):
 
 
 # Compare every supported engine/covariance pair to independent statsmodels OLS.
-# The sm engine does not expose non-robust covariance; direct OLS still provides
-# the reference for that configuration of the NumPy and JAX engines.
 _ENGINE_VCOV = [
     (engine, vcov)
-    for engine in ("np", "jax", "sm")
+    for engine in ("np", "jax")
     for vcov in ("non-robust", "HC1", "HC3", "HAC")
-    if (engine, vcov) != ("sm", "non-robust")
 ]
 
 
-def statsmodels_reference(model, vcov, *, preserve_gaps):
+def statsmodels_reference(model, vcov):
     """Fit full regressions without using smoothlp stacking or masking helpers."""
-    shocks = model.shock
-    design = shocks if model.exog is None else np.column_stack((shocks, model.exog))
+    n = model.n_lags_outcome
+    outcome_data = model.endog[n:]
+    shocks = model.shock[n:]
+    mask = None if model.mask is None else model.mask[n:]
+    diff = None if model.diff is None else model.diff[n:]
+    controls = [] if model.exog is None else [model.exog[n:]]
+    controls += [
+        model.endog[n - lag : len(model.endog) - lag, None] for lag in range(1, n + 1)
+    ]
+    design = np.column_stack([shocks, *controls])
     n_obs, n_params = design.shape
     n_shocks = shocks.shape[1]
     coefficients, covariances = [], []
     for h in range(model.H + 1):
         times = np.arange(n_obs - h)
         keep = np.ones(len(times), dtype=bool)
-        if model.mask is not None:
+        if mask is not None:
             if model.mask_type == "x":
-                keep = ~model.mask[times]
+                keep = ~mask[times]
             elif model.mask_type == "y":
-                keep = ~model.mask[times + h]
+                keep = ~mask[times + h]
             else:
-                keep = np.array([not model.mask[t : t + h + 1].any() for t in times])
-        outcome = model.endog[times + h]
-        if model.diff is not None:
-            outcome = outcome - model.diff[times]
+                keep = np.array([not mask[t : t + h + 1].any() for t in times])
+        outcome = outcome_data[times + h]
+        if diff is not None:
+            outcome = outcome - diff[times]
         fit = sm.OLS(outcome[keep], design[times[keep]]).fit()
         if vcov == "non-robust":
             covariance = fit.cov_params()
         elif vcov in ("HC1", "HC3"):
             covariance = fit.get_robustcov_results(cov_type=vcov).cov_params()
-        elif preserve_gaps and model.mask is not None:
+        elif mask is not None:
             # Preserve original time distances, using full-design OLS scores.
             scores = np.zeros((len(times), n_params))
             scores[keep] = fit.model.exog * fit.resid[:, None]
@@ -71,6 +76,30 @@ def statsmodels_reference(model, vcov, *, preserve_gaps):
     return np.array(coefficients), np.array(covariances)
 
 
+@pytest.mark.parametrize("engine", ["np", "jax"])
+@pytest.mark.parametrize(
+    "with_intercept", [False, True], ids=["no_controls", "intercept"]
+)
+def test_one_outcome_lag_against_statsmodels(engine, with_intercept):
+    # Keep this regression check separate from the full configuration grid.
+    rng = np.random.default_rng(813)
+    shock = rng.standard_normal(64)
+    y = np.zeros(len(shock))
+    noise = rng.standard_normal(len(shock))
+    for t in range(1, len(y)):
+        y[t] = 0.6 * y[t - 1] + shock[t] + noise[t]
+    controls = np.ones((len(y), 1)) if with_intercept else None
+    model = LocalProjection(y, shock, controls, H=2, n_lags_outcome=1)
+
+    expected_coef, expected_vcov = statsmodels_reference(model, "HC3")
+    actual = model.fit(vcov="HC3", engine=engine)
+
+    assert actual.coef.shape == expected_coef.shape == (3, 1)
+    assert actual.vcov.shape == expected_vcov.shape == (3, 1, 1)
+    npt.assert_allclose(actual.coef, expected_coef, rtol=1e-7, atol=1e-10)
+    npt.assert_allclose(actual.vcov, expected_vcov, rtol=1e-7, atol=1e-10)
+
+
 @pytest.fixture(scope="module", params=["none", "intercept", "four_lags"])
 def reference_data(request):
     rng = np.random.default_rng(812)
@@ -81,14 +110,11 @@ def reference_data(request):
     y = np.zeros(n_obs + 4)
     for t in range(1, len(y)):
         y[t] = 0.6 * y[t - 1] + shocks[t, 0] - 0.4 * shocks[t, 1] + noise[t]
-    controls = None
-    if request.param == "intercept":
-        controls = np.ones((n_obs, 1))
-    elif request.param == "four_lags":
-        controls = np.column_stack(
-            [np.ones(n_obs)] + [y[4 - lag : len(y) - lag] for lag in range(1, 5)]
-        )
-    return y[4:], shocks[4:], controls, y[3:-1].copy()
+    n_lags = 4 if request.param == "four_lags" else 0
+    start = 0 if n_lags else 4
+    controls = None if request.param == "none" else np.ones((len(y) - start, 1))
+    baseline = np.roll(y, 1)[start:].copy()
+    return y[start:], shocks[start:], controls, baseline, n_lags
 
 
 @pytest.mark.parametrize("engine,vcov", _ENGINE_VCOV)
@@ -103,20 +129,21 @@ def test_configurations_against_statsmodels(
     use_diff,
     mask_type,
 ):
-    y, shocks, controls, baseline = reference_data
+    y, shocks, controls, baseline, n_lags = reference_data
     shock = {"1d": shocks[:, 0], "one_column": shocks[:, :1], "two_columns": shocks}[
         shock_shape
     ]
     mask = None
     if mask_type is not None:
         mask = np.zeros(len(y), dtype=bool)
-        mask[[0, 19, len(y) - 1]] = True
-        mask[40:50] = True
+        mask[[n_lags, n_lags + 19, len(y) - 1]] = True
+        mask[n_lags + 40 : n_lags + 50] = True
     model = LocalProjection(
         y,
         shock,
         controls,
         H=5,
+        n_lags_outcome=n_lags,
         mask=mask,
         mask_type=mask_type or "both",
         diff=baseline if use_diff else None,
@@ -124,11 +151,7 @@ def test_configurations_against_statsmodels(
     originals = [
         None if x is None else x.copy() for x in (y, shock, controls, mask, model.diff)
     ]
-    expected_coef, expected_vcov = statsmodels_reference(
-        model,
-        vcov,
-        preserve_gaps=engine != "sm",
-    )
+    expected_coef, expected_vcov = statsmodels_reference(model, vcov)
     actual = model.fit(vcov=vcov, engine=engine)
     assert actual.coef.shape == expected_coef.shape
     assert actual.vcov.shape == expected_vcov.shape
@@ -151,18 +174,17 @@ def test_configurations_against_statsmodels(
 @pytest.mark.parametrize("mask_type", ["x", "y", "both"])
 @pytest.mark.parametrize("horizon", [0, 5])
 def test_empty_mask(reference_data, engine, vcov, mask_type, horizon):
-    y, shocks, controls, _ = reference_data
+    y, shocks, controls, _, n_lags = reference_data
     model = LocalProjection(
         y,
         shocks,
         controls,
         H=horizon,
+        n_lags_outcome=n_lags,
         mask=np.zeros(len(y), dtype=bool),
         mask_type=mask_type,
     )
-    expected_coef, expected_vcov = statsmodels_reference(
-        model, vcov, preserve_gaps=True
-    )
+    expected_coef, expected_vcov = statsmodels_reference(model, vcov)
     actual = model.fit(vcov=vcov, engine=engine)
     assert actual.coef.shape == (horizon + 1, 2)
     assert actual.vcov.shape == (horizon + 1, 2, 2)
@@ -216,8 +238,12 @@ def test_no_control_non_robust(interest_data_no_controls, interest_results):
     Y, shock, X = interest_data_no_controls
     coef, se = interest_results
 
-    res_np = LocalProjection(Y, shock, X, 12).fit(vcov="non-robust", engine="np")
-    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="non-robust", engine="jax")
+    res_np = LocalProjection(Y, shock, X, 12, n_lags_outcome=0).fit(
+        vcov="non-robust", engine="np"
+    )
+    res_jax = LocalProjection(Y, shock, X, 12, n_lags_outcome=0).fit(
+        vcov="non-robust", engine="jax"
+    )
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_np.se, se)
@@ -226,29 +252,31 @@ def test_no_control_non_robust(interest_data_no_controls, interest_results):
 
 def test_no_control_hc1(interest_data_no_controls, interest_results):
     Y, shock, X = interest_data_no_controls
-    coef, se = interest_results
+    coef, _ = interest_results
 
-    res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="np")
-    res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="sm")
-    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="jax")
+    res_np = LocalProjection(Y, shock, X, 12, n_lags_outcome=0).fit(
+        vcov="HC1", engine="np"
+    )
+    res_jax = LocalProjection(Y, shock, X, 12, n_lags_outcome=0).fit(
+        vcov="HC1", engine="jax"
+    )
 
     npt.assert_allclose(res_np.irf, coef)
-    npt.assert_allclose(res_sm.coef, res_np.coef)
-    npt.assert_allclose(res_sm.vcov, res_np.vcov)
     assert_lp_shocks_equal(res_jax, res_np, rtol=1e-5, atol=0)
 
 
 def test_no_control_hc3(interest_data_no_controls, interest_results):
     Y, shock, X = interest_data_no_controls
-    coef, se = interest_results
+    coef, _ = interest_results
 
-    res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="np")
-    res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="sm")
-    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="jax")
+    res_np = LocalProjection(Y, shock, X, 12, n_lags_outcome=0).fit(
+        vcov="HC3", engine="np"
+    )
+    res_jax = LocalProjection(Y, shock, X, 12, n_lags_outcome=0).fit(
+        vcov="HC3", engine="jax"
+    )
 
     npt.assert_allclose(res_np.irf, coef)
-    npt.assert_allclose(res_sm.coef, res_np.coef)
-    npt.assert_allclose(res_sm.vcov, res_np.vcov)
     assert_lp_shocks_equal(res_jax, res_np, rtol=1e-5, atol=0)
 
 
@@ -259,25 +287,25 @@ def test_no_control_hac(interest_data_no_controls, interest_results_nw):
     T = X.shape[0] - np.arange(13)
     se = se * np.sqrt(T / (T - 2))
 
-    res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="np")
-    res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="sm")
-    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="jax")
+    res_np = LocalProjection(Y, shock, X, 12, n_lags_outcome=0).fit(
+        vcov="HAC", engine="np"
+    )
+    res_jax = LocalProjection(Y, shock, X, 12, n_lags_outcome=0).fit(
+        vcov="HAC", engine="jax"
+    )
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_np.se, se)
-    npt.assert_allclose(res_sm.coef, res_np.coef)
-    npt.assert_allclose(res_np.vcov, res_sm.vcov)
     assert_lp_shocks_equal(res_jax, res_np, rtol=1e-5, atol=0)
 
 
 def test_no_control_non_robust_l4(interest_data_no_controls, interest_results_lags4):
     Y, shock, X = interest_data_no_controls
-    X = np.concat([X, np.stack([np.roll(Y, i) for i in range(1, 5)], axis=1)], axis=1)
-    Y, shock, X = Y[4:], shock[4:], X[4:, :]
+    model = LocalProjection(Y, shock, X, 12, n_lags_outcome=4)
     coef, se = interest_results_lags4
 
-    res_np = LocalProjection(Y, shock, X, 12).fit(vcov="non-robust", engine="np")
-    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="non-robust", engine="jax")
+    res_np = model.fit(vcov="non-robust", engine="np")
+    res_jax = model.fit(vcov="non-robust", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_np.se, se)
@@ -286,51 +314,39 @@ def test_no_control_non_robust_l4(interest_data_no_controls, interest_results_la
 
 def test_no_control_hc1_l4(interest_data_no_controls, interest_results_lags4):
     Y, shock, X = interest_data_no_controls
-    X = np.concat([X, np.stack([np.roll(Y, i) for i in range(1, 5)], axis=1)], axis=1)
-    Y, shock, X = Y[4:], shock[4:], X[4:, :]
-    coef, se = interest_results_lags4
+    model = LocalProjection(Y, shock, X, 12, n_lags_outcome=4)
+    coef, _ = interest_results_lags4
 
-    res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="np")
-    res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="sm")
-    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HC1", engine="jax")
+    res_np = model.fit(vcov="HC1", engine="np")
+    res_jax = model.fit(vcov="HC1", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
-    npt.assert_allclose(res_sm.coef, res_np.coef)
-    npt.assert_allclose(res_sm.vcov, res_np.vcov)
     assert_lp_shocks_equal(res_jax, res_np, atol=1e-5, rtol=1e-5)
 
 
 def test_no_control_hc3_l4(interest_data_no_controls, interest_results_lags4):
     Y, shock, X = interest_data_no_controls
-    X = np.concat([X, np.stack([np.roll(Y, i) for i in range(1, 5)], axis=1)], axis=1)
-    Y, shock, X = Y[4:], shock[4:], X[4:, :]
-    coef, se = interest_results_lags4
+    model = LocalProjection(Y, shock, X, 12, n_lags_outcome=4)
+    coef, _ = interest_results_lags4
 
-    res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="np")
-    res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="sm")
-    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HC3", engine="jax")
+    res_np = model.fit(vcov="HC3", engine="np")
+    res_jax = model.fit(vcov="HC3", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
-    npt.assert_allclose(res_sm.coef, res_np.coef)
-    npt.assert_allclose(res_sm.vcov, res_np.vcov)
     assert_lp_shocks_equal(res_jax, res_np, atol=1e-5, rtol=1e-5)
 
 
 def test_no_control_hac_l4(interest_data_no_controls, interest_results_nw_lags4):
     Y, shock, X = interest_data_no_controls
-    X = np.concat([X, np.stack([np.roll(Y, i) for i in range(1, 5)], axis=1)], axis=1)
-    Y, shock, X = Y[4:], shock[4:], X[4:, :]
+    model = LocalProjection(Y, shock, X, 12, n_lags_outcome=4)
     coef, se = interest_results_nw_lags4
     # Apply the small sample correction, since this is not done in lpirfs
-    T = X.shape[0] - np.arange(13)
+    T = X.shape[0] - 4 - np.arange(13)
     se = se * np.sqrt(T / (T - 6))
 
-    res_np = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="np")
-    res_sm = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="sm")
-    res_jax = LocalProjection(Y, shock, X, 12).fit(vcov="HAC", engine="jax")
+    res_np = model.fit(vcov="HAC", engine="np")
+    res_jax = model.fit(vcov="HAC", engine="jax")
 
     npt.assert_allclose(res_np.irf, coef)
     npt.assert_allclose(res_np.se, se)
-    npt.assert_allclose(res_sm.coef, res_np.coef)
-    npt.assert_allclose(res_np.vcov, res_sm.vcov)
     assert_lp_shocks_equal(res_jax, res_np, atol=1e-5, rtol=1e-5)

@@ -13,12 +13,18 @@ from jax.numpy import newaxis as nax
 
 from smoothlp._blocked import blocked_cholesky, block_solve, fill
 from smoothlp.models import AbstractLocalProjection
-from smoothlp.utils import bspline, demean, build_stacked, partial_out
+from smoothlp.utils import bspline, demean, prepare_data, partial_out, comp_lrv
 
 
 @dataclass
 class SmoothLocalProjection(AbstractLocalProjection):
-    """Run a smoothed local projection"""
+    """Run a smoothed local projection.
+
+    With outcome lags, the first lag receives a penalized spline path alongside
+    the shocks. Remaining lags are controls: partialled out by default, or
+    fitted with penalized spline paths when ``partial_out=False``. Results
+    contain only the original shocks. Set ``n_lags_outcome=0`` to add no lags.
+    """
 
     fe: tuple[np.ndarray] | tuple
 
@@ -33,6 +39,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         shock: np.ndarray,
         exog: np.ndarray | None,
         H: int,
+        n_lags_outcome: int = 1,
         target_poly_order: int = 2,
         fe: tuple[np.ndarray] | np.ndarray | None = None,
         mask: np.ndarray | None = None,
@@ -41,7 +48,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
     ):
         assert mask_type == "both", "Only mask_type='both' is supported"
         assert mask_any_prev_h, "Only mask_any_prev_h=True is supported"
-        super().__init__(endog, shock, exog, H, mask, mask_type)
+        super().__init__(endog, shock, exog, H, n_lags_outcome, mask, mask_type)
         if fe is None:
             self.fe = tuple()
         else:
@@ -99,6 +106,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
 
         params = {
             "H": self.H,
+            "n_lags_outcome": self.n_lags_outcome,
             "n_diff": self.n_diff,
             "lam_selection": lam_selection,
             "lam": lam,
@@ -185,6 +193,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         jax.jit,
         static_argnames=(
             "H",
+            "n_lags_outcome",
             "n_diff",
             "partial_out_exog",
             "lam_selection",
@@ -198,6 +207,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         exog: Float[Array, "T k"],
         mask: Float[Array, " T"] | None,
         H: int,
+        n_lags_outcome: int,
         n_diff: int,
         lam_selection: None | Literal["cv", "gcv"],
         lam: None | float,
@@ -207,14 +217,16 @@ class SmoothLocalProjection(AbstractLocalProjection):
         partial_out_exog: bool = False,
     ):
         """Fit with block solves, optionally partialling out controls first."""
-        T = endog.shape[0]
+
         k = B.shape[1]
         n_shocks = shock.shape[1]
-
-        # Build the stacked mask and outcome array.
-        if mask is None:
-            mask = jnp.ones(T)
-        Ys, mask_s = build_stacked("jax", endog, mask, H, "both")
+        _, Ys, shock, exog, mask_s = prepare_data(
+            "jax", endog, shock, exog, mask, H, n_lags_outcome, "both"
+        )
+        # prepare_data promotes the first outcome lag to a fitted shock path.
+        shock_offset = int(n_lags_outcome > 0)
+        if exog is None:
+            exog = jnp.empty((Ys.shape[0], 0), dtype=shock.dtype)
         N = jnp.sum(mask_s)
 
         if partial_out_exog:
@@ -229,9 +241,9 @@ class SmoothLocalProjection(AbstractLocalProjection):
 
         # Build the penalty matrix
         q = n * k
-        D = jnp.eye(k)
+        D = np.eye(k)
         for i in range(n_diff):
-            D = jnp.diff(D, axis=0)
+            D = np.diff(D, axis=0)
         basis_penalty = D.T @ D
         # Coefficients are basis-major: (b1*x1, ..., b1*xn, b2*x1, ...).
         # Therefore every entry of the basis penalty is an n-by-n diagonal
@@ -303,7 +315,8 @@ class SmoothLocalProjection(AbstractLocalProjection):
         # Select shock-major spline blocks for the covariance matrix,
         # while retaining basis-major ordering internally.
         shock_indices = (
-            jnp.arange(n_shocks)[:, jnp.newaxis] + n * jnp.arange(k)[jnp.newaxis, :]
+            (shock_offset + jnp.arange(n_shocks))[:, jnp.newaxis]
+            + n * jnp.arange(k)[jnp.newaxis, :]
         ).reshape(-1)
         selector = jnp.eye(q)[shock_indices]
 
@@ -317,22 +330,9 @@ class SmoothLocalProjection(AbstractLocalProjection):
         else:
             g = jnp.einsum("tk,ts,ksl->tl", us @ B, shock_r, W)
 
-        def accumulate(carry, lag):
-            shifted, weighted = carry
+        lrv = comp_lrv(g[:, :, None], jnp.array([H]), max_lags=H)
+        lrv = lrv[:, :, 0]
 
-            # Advance one time step, zero-padding instead of wrapping.
-            shifted = jnp.roll(shifted, -1, axis=0).at[-1].set(0.0)
-            weight = 1.0 - lag / (H + 1)
-            return (shifted, weighted + weight * shifted), None
-
-        (_, weighted), _ = lax.scan(
-            accumulate,
-            (g, 0.5 * g),
-            jnp.arange(1, H + 1),
-        )
-
-        cross = g.T @ weighted
-        lrv = cross + cross.T
         coef = theta[shock_indices].reshape((n_shocks, k)).T
 
         shocks_partial = shock if partial_out_exog else None

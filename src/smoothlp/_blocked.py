@@ -1,57 +1,60 @@
+import numpy as np
+
 from jax import lax, Array
 from jax import numpy as jnp, scipy as jsp
 from jaxtyping import Float
 
 
-def fill(data, lower: bool = False):
+def fill(data: Float[Array, "n n_bands k k"], lower: bool = False):
     """Expand column-indexed lower block bands into a dense matrix."""
     k, n_bands, n, _ = data.shape
-    res = jnp.zeros((n * k, n * k), dtype=data.dtype)
-    for column in range(k):
-        column_slice = slice(column * n, (column + 1) * n)
-        for offset in range(min(n_bands, k - column)):
-            row = column + offset
-            row_slice = slice(row * n, (row + 1) * n)
-            block = data[column, offset]
-            res = res.at[row_slice, column_slice].set(block)
-            if offset and not lower:
-                res = res.at[column_slice, row_slice].set(block.T)
-    return res
+
+    columns = jnp.arange(k)[:, None]
+    rows = columns + jnp.arange(n_bands)[None, :]
+
+    blocks = jnp.zeros((k, k, n, n), dtype=data.dtype)
+    blocks = blocks.at[rows, columns].set(data, mode="drop")
+    if not lower:
+        blocks = blocks.at[columns, rows[:, 1:]].set(
+            data[:, 1:].swapaxes(-1, -2), mode="drop"
+        )
+    blocks = blocks.transpose(0, 2, 1, 3).reshape((n * k, n * k))
+
+    return blocks
 
 
-def blocked_cholesky(A: Float[Array, "n k k"]):
-    n = A.shape[1]
-    k = A.shape[2]
-    print(A.shape)
-    subdiag_elems = int(n * (n + 1) / 2 - n)
-    carry = jnp.zeros((subdiag_elems, k, k))
+def blocked_cholesky(A: Float[Array, "n_blocks n_bands k k"]):
+    """Factor lower block bands, scanning columns with batched band updates."""
+    n_bands, k = A.shape[1:3]
+    n_off = n_bands - 1
 
-    def f(carry, input):
-        L11 = jnp.linalg.cholesky(input[0, ...] - carry[0, ...])
-        R = []
-        res = []
-        for i in range(1, n):
-            rhs = input[i, ...]
-            if i < n - 1:
-                rhs = rhs - carry[i, ...]
-            Ri = jsp.linalg.solve_triangular(L11, rhs.T, lower=True)
-            R.append(Ri)
-            res.append(Ri.T)
-        # carry = jnp.stack([R12_1.T @ R12_1 + c3, R12_2.T @ R12_1, R12_2.T @ R12_2], axis=0)
-        new_carry = []
-        pos = 0
-        for i in range(n - 1):
-            for j in range(i, n - 1):
-                tmp = R[j].T @ R[i]
-                prev_carry_pos = pos + (n - i - 1)
-                if j < n - 2:
-                    tmp += carry[prev_carry_pos, ...]
-                new_carry.append(tmp)
-                pos += 1
-        res = jnp.stack([L11] + res, axis=0)
-        return jnp.stack(new_carry, axis=0), res
+    # The carry stores pairs (i, j), i <= j, in row-major triangular order.
+    # Build these shape-dependent indices on the host rather than tracing loops.
+    pair_i, pair_j = np.triu_indices(n_off)
+    has_previous = pair_j < n_off - 1
+    previous = np.where(has_previous, np.arange(len(pair_i)) + n_off - pair_i, 0)
+    carry = jnp.zeros((len(pair_i), k, k), dtype=A.dtype)
 
-    _, res = lax.scan(f, carry, A)
+    def factor_column(carry, column):
+        diagonal = jnp.linalg.cholesky(column[0] - carry[0])
+        corrections = jnp.concatenate(
+            (carry[1:n_off], jnp.zeros_like(column[:1])), axis=0
+        )
+        rhs = column[1:] - corrections
+
+        # Solve all off-diagonal blocks against the same factor in one call.
+        packed = rhs.transpose(2, 0, 1).reshape(k, n_off * k)
+        R = jsp.linalg.solve_triangular(diagonal, packed, lower=True)
+        R = R.reshape(k, n_off, k).transpose(1, 0, 2)
+
+        products = R[pair_j].swapaxes(-1, -2) @ R[pair_i]
+        next_carry = products + jnp.where(
+            has_previous[:, None, None], carry[previous], 0
+        )
+        factor = jnp.concatenate((diagonal[None], R.swapaxes(-1, -2)), axis=0)
+        return next_carry, factor
+
+    _, res = lax.scan(factor_column, carry, A)
     return res
 
 
@@ -62,27 +65,21 @@ def block_solve(
 ):
     """Solve ``L x = a``, or ``L.T x = a`` when ``lower=False``."""
     k, n, b = chol.shape[:3]
-    l = a.shape[-1]
-    carry = jnp.zeros((n - 1, b, l), dtype=jnp.result_type(chol, a))
+    m = a.shape[-1]
+    carry = jnp.zeros((n - 1, b, m), dtype=jnp.result_type(chol, a))
 
     def solve_lower(carry, data):
         a, L = data
         x1 = jsp.linalg.solve_triangular(L[0, ...], a - carry[0, ...], lower=True)
-        nc = jnp.zeros_like(carry)
-        nc = nc.at[:-1].set(carry[1:, ...])
-        for i in range(1, n):
-            nc = nc.at[i - 1].add(L[i, ...] @ x1)
+        shifted = jnp.concatenate((carry[1:], jnp.zeros_like(carry[:1])), axis=0)
+        nc = shifted + L[1:] @ x1
         return nc, x1
 
     def solve_upper(carry, data):
         a, L = data
-        rhs = a
-        for i in range(1, n):
-            rhs = rhs - L[i, ...].T @ carry[i - 1, ...]
+        rhs = a - jnp.einsum("aij,ail->jl", L[1:], carry)
         x1 = jsp.linalg.solve_triangular(L[0, ...].T, rhs, lower=False)
-        nc = jnp.zeros_like(carry)
-        nc = nc.at[1:].set(carry[:-1, ...])
-        nc = nc.at[0].set(x1)
+        nc = jnp.concatenate((x1[None], carry[:-1]), axis=0)
         return nc, x1
 
     if lower:

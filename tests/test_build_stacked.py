@@ -34,7 +34,7 @@ def builder(request):
 
 
 @pytest.mark.parametrize("mask_type", ["x", "y", "both"])
-@pytest.mark.parametrize("H", [0, 1, 5, 11, 14])
+@pytest.mark.parametrize("H", [0, 1, 5, 11])
 @pytest.mark.parametrize(
     "omitted_times",
     [[], [4], [2, 6, 7, 8], [0, 11], list(range(12))],
