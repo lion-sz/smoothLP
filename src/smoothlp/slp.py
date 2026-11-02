@@ -88,6 +88,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         lam_grid_lower: float = -3.0,
         lam_grid_upper: float = 3.0,
         lam_grid_size: int = 1_000,
+        zero_penalty: float = 0.0,
         partial_out: bool = True,
     ):
         if isinstance(lam, Real):
@@ -99,6 +100,9 @@ class SmoothLocalProjection(AbstractLocalProjection):
             lam = None
         else:
             raise ValueError("lam must be a real number, None, 'gcv', or 'cv'")
+        assert isinstance(zero_penalty, float) and zero_penalty >= 0, (
+            f"Zero Penalty '{zero_penalty}' invalid"
+        )
 
         if len(self.fe) > 0:
             res = demean(self.fe, [self.endog, self.shock, self.exog], mask=self.mask)
@@ -113,6 +117,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
             "lam_grid_lower": lam_grid_lower,
             "lam_grid_upper": lam_grid_upper,
             "lam_grid_size": lam_grid_size,
+            "zero_penalty": zero_penalty,
         }
 
         s = datetime.now()
@@ -215,6 +220,7 @@ class SmoothLocalProjection(AbstractLocalProjection):
         lam_grid_upper: float,
         lam_grid_size: int,
         partial_out_exog: bool = False,
+        zero_penalty: float = 0.0,
     ):
         """Fit with block solves, optionally partialling out controls first."""
 
@@ -255,6 +261,22 @@ class SmoothLocalProjection(AbstractLocalProjection):
         for i in range(min(n_diff + 1, k)):
             d = jnp.diag(basis_penalty, k=-i)
             Ps = Ps.at[: (k - i), i].set(d[:, nax, nax] * jnp.eye(n))
+
+        # Apply the zero penalty.
+        # I penalize beta_j(0)^2, for all j corresponding to shocks.
+        # Since beta_j(0) = B(0) @ b_j, beta_j(0)^2 = b_j.T @ B(0)^T @ B(0) @ b_j.
+        # I need to add this inner penalty matrix to the first 3 basis functions.
+        impact_selector = (
+            jnp.zeros(n).at[shock_offset : shock_offset + n_shocks].set(1.0)
+        )
+        b0 = B[0]
+        # B(0) has support on the first three cubic basis functions, so
+        # the impact penalty fits within the existing three lower bands.
+        for i in range(min(3, k)):
+            d = b0[i:] * b0[: k - i]  # The elements of B(0)^T B(0)
+            Ps = Ps.at[: k - i, i].add(
+                zero_penalty * d[:, nax, nax] * jnp.diag(impact_selector)
+            )
 
         XTX_stacked = SmoothLocalProjection._comp_XTX(
             shock_r, mask_s, B, n_bands, partial_out_exog
